@@ -14,6 +14,7 @@ using Content.Shared.Chemistry.EntitySystems;
 using Content.Shared.Hands.EntitySystems;
 using Content.Shared.Storage;
 using Robust.Shared.Containers;
+using RobustoClient.Systems.Abstract;
 
 namespace RobustoClient.Systems.AutoChem;
 
@@ -25,6 +26,7 @@ public sealed class RobustaWorldScanner : EntitySystem
     [Dependency] private readonly EntityLookupSystem _lookup = default!;
     [Dependency] private readonly SharedHandsSystem _hands = default!;
     [Dependency] private readonly SharedContainerSystem _containerSystem = default!;
+    [Dependency] private readonly ItemUtilitySystem _itemUtil = default!;
 
     public const float InteractionRange = 1.5f;
 
@@ -120,6 +122,11 @@ public sealed class RobustaWorldScanner : EntitySystem
         {
             if (IsBeaker(heldItem)) return heldItem;
         }
+
+        var loc = _itemUtil.FindItemByPredicate(IsBeaker);
+        if (loc != null && loc.Source == ItemSource.Hand)
+            return loc.Entity;
+
         return null;
     }
 

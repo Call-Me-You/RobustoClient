@@ -276,47 +276,12 @@ public sealed class SearchAmmoState : ReloadStateBase
         return false;
     }
 
-    private static readonly System.Reflection.PropertyInfo? ProtoComponentsProp =
-        typeof(EntityPrototype).GetProperty("Components", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-    private static System.Reflection.PropertyInfo? _entryComponentProp;
-    private static System.Reflection.FieldInfo? _entryComponentField;
-    private static bool _entryReflected;
-
-    private static System.Collections.IDictionary? GetProtoComponentsDict(EntityPrototype proto)
-        => ProtoComponentsProp?.GetValue(proto) as System.Collections.IDictionary;
-
-    private static bool ProtoHasComponent(System.Collections.IDictionary dict, string compName)
-        => dict.Contains(compName);
-
-    private static T? GetProtoComponent<T>(System.Collections.IDictionary dict, string compName) where T : class
-    {
-        if (!dict.Contains(compName))
-            return null;
-
-        var entry = dict[compName];
-        if (entry == null)
-            return null;
-
-        if (!_entryReflected)
-        {
-            var entryType = entry.GetType();
-            _entryComponentProp = entryType.GetProperty("Component", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            _entryComponentField = entryType.GetField("Component", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            _entryReflected = true;
-        }
-
-        var comp = _entryComponentProp?.GetValue(entry) ?? _entryComponentField?.GetValue(entry);
-        return comp as T;
-    }
-
     private bool IsPrototypeValid(EntityWhitelist whitelist, string protoId, AutoReloadContext context)
     {
         if (!context.ProtoManager.TryIndex<EntityPrototype>(protoId, out var proto))
             return false;
 
-        var compDict = GetProtoComponentsDict(proto);
-        if (compDict == null)
-            return false;
+        var itemUtil = context.ItemUtility;
 
         if (whitelist.RequireAll)
         {
@@ -324,13 +289,12 @@ public sealed class SearchAmmoState : ReloadStateBase
             {
                 foreach (var compName in whitelist.Components)
                 {
-                    if (!ProtoHasComponent(compDict, compName)) return false;
+                    if (!itemUtil.HasPrototypeComponent(proto, compName)) return false;
                 }
             }
             if (whitelist.Tags != null)
             {
-                var tagComp = GetProtoComponent<TagComponent>(compDict, "Tag");
-                if (tagComp == null)
+                if (!itemUtil.TryGetPrototypeComponent<TagComponent>(proto, "Tag", out var tagComp) || tagComp == null)
                     return whitelist.Tags.Count == 0;
 
                 foreach (var tag in whitelist.Tags)
@@ -346,13 +310,12 @@ public sealed class SearchAmmoState : ReloadStateBase
             {
                 foreach (var compName in whitelist.Components)
                 {
-                    if (ProtoHasComponent(compDict, compName)) return true;
+                    if (itemUtil.HasPrototypeComponent(proto, compName)) return true;
                 }
             }
             if (whitelist.Tags != null)
             {
-                var tagComp = GetProtoComponent<TagComponent>(compDict, "Tag");
-                if (tagComp != null)
+                if (itemUtil.TryGetPrototypeComponent<TagComponent>(proto, "Tag", out var tagComp) && tagComp != null)
                 {
                     foreach (var tag in whitelist.Tags)
                     {

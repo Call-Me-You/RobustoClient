@@ -8,6 +8,7 @@ using Robust.Shared.Timing;
 using Robust.Shared.Prototypes;
 using Robust.Client.Input;
 using Robust.Client.Player;
+using RobustoClient.Systems.Abstract;
 using RobustoClient.Systems.AutoChem;
 using System.Collections.Generic;
 using Robust.Shared.GameObjects;
@@ -31,6 +32,7 @@ public sealed class AutoReloadContext
     public SharedHandsSystem HandsSystem => EntManager.System<SharedHandsSystem>();
     public SharedInteractionSystem InteractionSystem => EntManager.System<SharedInteractionSystem>();
     public RobustaNetworkHands NetworkHands => EntManager.System<RobustaNetworkHands>();
+    public ItemUtilitySystem ItemUtility => EntManager.System<ItemUtilitySystem>();
 
     public readonly ISawmill Logger;
 

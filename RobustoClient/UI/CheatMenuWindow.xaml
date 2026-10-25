@@ -102,6 +102,16 @@
                             <Button Text="Open Station Map" Name="OpenMapBtn" HorizontalExpand="True" />
                             <Button Text="Open Tactical Radar" Name="OpenTacticalRadarBtn" HorizontalExpand="True" />
                         </BoxContainer>
+                        <BoxContainer Orientation="Horizontal" SeparationOverride="10">
+                            <Button Text="Auto-Build (Tap V)" Name="AutoConstructBtn" HorizontalExpand="True" />
+                            <Button Text="Auto-Decon (2xV / N)" Name="AutoDeconstructBtn" HorizontalExpand="True" />
+                            <Button Text="Stop" Name="StopConstructBtn" />
+                        </BoxContainer>
+                        <BoxContainer Orientation="Horizontal" SeparationOverride="5">
+                            <LineEdit Name="BlueprintExportNameInput" PlaceHolder="Blueprint name..." HorizontalExpand="True" MinWidth="160"/>
+                            <Button Text="Save Area (2 Clicks)" Name="ExportBlueprintBtn" />
+                            <Button Text="Reload Blueprints" Name="ReloadBlueprintsBtn" />
+                        </BoxContainer>
                         <BoxContainer Orientation="Horizontal" SeparationOverride="5" Margin="0 10 0 0">
                             <LineEdit Name="ItemSearchInput" PlaceHolder="Item Search..." HorizontalExpand="True" MinWidth="200"/>
                             <Button ToggleMode="True" Text="Search" Name="ItemSearchBtn" />

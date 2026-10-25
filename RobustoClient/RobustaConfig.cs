@@ -47,6 +47,10 @@ public static class RobustaConfig
 
     public static Keyboard.Key TargetLockKey = Keyboard.Key.Space;
 
+    public static Keyboard.Key AutoConstructKey = Keyboard.Key.V;
+
+    public static Keyboard.Key AutoDeconstructKey = Keyboard.Key.N;
+
     public static bool ThrowAimbotEnabled = true;
 
     public static float AimFovPixels { get; set; } = 100f; // Aimbot capture radius in pixels (Screen FOV)
@@ -98,6 +102,8 @@ public static class RobustaConfig
         public bool UsePrediction { get; set; }
         public float AimRadius { get; set; } = 5f;
         public float MaxLockDistance { get; set; } = 15f;
+        public Keyboard.Key AutoConstructKey { get; set; } = Keyboard.Key.V;
+        public Keyboard.Key AutoDeconstructKey { get; set; } = Keyboard.Key.N;
         public bool ThrowAimbotEnabled { get; set; } = true;
         public float AimFovPixels { get; set; } = 100f;
         public float DefaultThrowSpeed { get; set; } = 11f;
@@ -134,6 +140,8 @@ public static class RobustaConfig
                 UsePrediction = UsePrediction,
                 AimRadius = AimRadius,
                 MaxLockDistance = MaxLockDistance,
+                AutoConstructKey = AutoConstructKey,
+                AutoDeconstructKey = AutoDeconstructKey,
                 ThrowAimbotEnabled = ThrowAimbotEnabled,
                 AimFovPixels = AimFovPixels,
                 DefaultThrowSpeed = DefaultThrowSpeed,
@@ -179,6 +187,10 @@ public static class RobustaConfig
             UsePrediction = data.UsePrediction;
             AimRadius = data.AimRadius;
             MaxLockDistance = data.MaxLockDistance;
+            if (data.AutoConstructKey != Keyboard.Key.Unknown)
+                AutoConstructKey = data.AutoConstructKey;
+            if (data.AutoDeconstructKey != Keyboard.Key.Unknown)
+                AutoDeconstructKey = data.AutoDeconstructKey;
             ThrowAimbotEnabled = data.ThrowAimbotEnabled;
             AimFovPixels = data.AimFovPixels;
             DefaultThrowSpeed = data.DefaultThrowSpeed;

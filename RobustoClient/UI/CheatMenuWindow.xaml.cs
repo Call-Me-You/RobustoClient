@@ -131,6 +131,32 @@ public sealed partial class CheatMenuWindow : RobustaWindow
         OpenMapBtn.OnPressed += _ => RobustaMapOpener.Show();
         OpenTacticalRadarBtn.OnPressed += _ => RobustaRadarOpener.Show();
 
+        AutoConstructBtn.OnPressed += _ =>
+        {
+            if (_entMan.EntitySysManager.TryGetEntitySystem<RobustoClient.Systems.Construction.RobustaAutoConstructSystem>(out var autoSys))
+                autoSys.TriggerAtCursor(forceDeconstruct: false);
+        };
+        AutoDeconstructBtn.OnPressed += _ =>
+        {
+            if (_entMan.EntitySysManager.TryGetEntitySystem<RobustoClient.Systems.Construction.RobustaAutoConstructSystem>(out var autoSys))
+                autoSys.TriggerAtCursor(forceDeconstruct: true);
+        };
+        StopConstructBtn.OnPressed += _ =>
+        {
+            if (_entMan.EntitySysManager.TryGetEntitySystem<RobustoClient.Systems.Construction.RobustaAutoConstructSystem>(out var autoSys))
+                autoSys.StopJob();
+        };
+        ExportBlueprintBtn.OnPressed += _ =>
+        {
+            if (_entMan.EntitySysManager.TryGetEntitySystem<RobustoClient.Systems.Construction.Blueprints.RobustaBlueprintManager>(out var bpMan))
+                bpMan.StartAreaExportSelection(BlueprintExportNameInput.Text);
+        };
+        ReloadBlueprintsBtn.OnPressed += _ =>
+        {
+            if (_entMan.EntitySysManager.TryGetEntitySystem<RobustoClient.Systems.Construction.Blueprints.RobustaBlueprintManager>(out var bpMan))
+                bpMan.LoadAllBlueprints();
+        };
+
         // Ping Handlers
         PingLocal.OnPressed += _ => SetPingMode(RobustaConfig.PingMode.Local);
         PingStable.OnPressed += _ => SetPingMode(RobustaConfig.PingMode.Stable);
