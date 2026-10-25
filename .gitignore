@@ -259,3 +259,7 @@ FakesAssemblies/
 
 # Visual Studio 6 workspace options file
 *.optAutoChemLog.txt
+
+# Cline bs
+.clinerules/
+.agents/

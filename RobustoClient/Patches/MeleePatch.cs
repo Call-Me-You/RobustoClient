@@ -1,20 +1,19 @@
+using System;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Reflection;
 using Content.Client.Weapons.Melee;
 using Content.Client.MouseRotator;
 using Content.Shared.MouseRotator;
 using Content.Shared.Hands.EntitySystems;
 using Content.Shared.Weapons.Melee;
 using HarmonyLib;
-using Robust.Client.GameObjects;
-using Robust.Client.Input;
 using Robust.Client.Player;
 using Robust.Shared.GameObjects;
 using Robust.Shared.IoC;
 using Robust.Shared.Map;
 using Robust.Shared.Maths;
 using Robust.Shared.Timing;
-using Robust.Shared.Utility;
 using RobustoClient.Systems;
 
 namespace RobustoClient.Patches;
@@ -28,6 +27,11 @@ public static class MeleePatch
 {
     private static IEntityManager? _entMan;
     private static RobustaAimSystem? _aim;
+
+    private static readonly MethodInfo? ClientLightAttackMethod =
+        AccessTools.Method(typeof(MeleeWeaponSystem), "ClientLightAttack");
+    private static readonly MethodInfo? PlayMeleeWeaponAnimationMethod =
+        AccessTools.Method(typeof(MeleeWeaponSystem), "PlayMeleeWeaponAnimation");
 
     private static RobustaAimSystem Aim
     {
@@ -91,7 +95,7 @@ public static class MeleePatch
         [HarmonyPrefix]
         private static bool Prefix()
         {
-            if (!RobustaConfig.RangedAimbotEnabled && !RobustaConfig.MeleeAimbotEnabled && !RobustaConfig.MeleeTriggerbotEnabled)
+            if (!RobustaConfig.MeleeAimbotEnabled && !RobustaConfig.MeleeTriggerbotEnabled)
                 return true;
 
             var playerManager = IoCManager.Resolve<IPlayerManager>();
@@ -106,14 +110,27 @@ public static class MeleePatch
 
             var aimSystem = Aim;
             var xformSystem = entityManager.System<SharedTransformSystem>();
+            var handsSystem = entityManager.System<SharedHandsSystem>();
+
+            EntityUid? weapon = null;
+            MeleeWeaponComponent? melee = null;
+            if (handsSystem.TryGetActiveItem(localPlayer.Value, out var activeWeapon) &&
+                entityManager.TryGetComponent(activeWeapon.Value, out MeleeWeaponComponent? meleeComp))
+            {
+                weapon = activeWeapon;
+                melee = meleeComp;
+            }
+
+            float searchRange = melee != null ? melee.Range : RobustaConfig.RangedAimbotRadius;
 
             var exclude = new HashSet<EntityUid> { localPlayer.Value };
-            var mouseScreenPos = IoCManager.Resolve<IInputManager>().MouseScreenPosition;
-            var target = aimSystem.GetClosestInRange(mouseScreenPos, RobustaConfig.RangedAimbotRadius, exclude);
+            var target = aimSystem.LockedTarget.HasValue && aimSystem.IsInRange(localPlayer.Value, aimSystem.LockedTarget.Value, searchRange)
+                ? aimSystem.GetAimOutputFromEnt(aimSystem.LockedTarget.Value)
+                : aimSystem.GetClosestToEntInRange(localPlayer.Value, searchRange, exclude);
 
             if (target == null) return true;
 
-            if (!entityManager.TryGetComponent<TransformComponent>(localPlayer.Value, out var xform))
+            if (!entityManager.TryGetComponent<TransformComponent>(localPlayer.Value, out _))
                 return true;
 
             var playerWorldPos = xformSystem.GetWorldPosition(localPlayer.Value);
@@ -122,40 +139,25 @@ public static class MeleePatch
 
             if (diff.LengthSquared() <= 0.001f) return true;
 
-            if (RobustaConfig.MeleeAimbotEnabled || RobustaConfig.MeleeTriggerbotEnabled)
-            {
-                var baseAngle = diff.ToAngle();
-                var correctedAngle = new Angle(baseAngle.Theta + MathHelper.PiOver2);
-                xformSystem.SetWorldRotation(localPlayer.Value, correctedAngle);
-            }
+            var baseAngle = diff.ToAngle();
+            var correctedAngle = new Angle(baseAngle.Theta + MathHelper.PiOver2);
+            xformSystem.SetWorldRotation(localPlayer.Value, correctedAngle);
 
-            if (RobustaConfig.MeleeTriggerbotEnabled)
+            if (RobustaConfig.MeleeTriggerbotEnabled && weapon.HasValue && melee != null)
             {
-                var handsSystem = entityManager.System<SharedHandsSystem>();
-                var meleeSystem = entityManager.System<MeleeWeaponSystem>();
-
-                if (handsSystem.TryGetActiveItem(localPlayer.Value, out var weapon) &&
-                    entityManager.TryGetComponent<MeleeWeaponComponent>(weapon.Value, out var melee))
+                if (diff.Length() <= melee.Range && timing.CurTime >= melee.NextAttack)
                 {
-                    if (diff.Length() <= melee.Range && timing.CurTime >= melee.NextAttack)
-                    {
-                        var targetCoords = new EntityCoordinates(target.Value.Entity, Vector2.Zero);
+                    var meleeSystem = entityManager.System<MeleeWeaponSystem>();
+                    var targetCoords = new EntityCoordinates(target.Value.Entity, Vector2.Zero);
 
-                        Traverse.Create(meleeSystem).Method("ClientLightAttack",
-                            localPlayer.Value, target.Value.Position, targetCoords, weapon.Value, melee).GetValue();
+                    ClientLightAttackMethod?.Invoke(meleeSystem, [localPlayer.Value, target.Value.Position, targetCoords, weapon.Value, melee]);
+                    PlayMeleeWeaponAnimationMethod?.Invoke(meleeSystem, [weapon.Value, melee, diff.ToAngle(), target.Value.Entity, false]);
 
-                        Traverse.Create(meleeSystem).Method("PlayMeleeWeaponAnimation",
-                            weapon.Value, melee, diff.ToAngle(), target.Value.Entity, false).GetValue();
-
-                        melee.NextAttack = timing.CurTime + TimeSpan.FromSeconds(1.1 / melee.AttackRate);
-                    }
+                    melee.NextAttack = timing.CurTime + TimeSpan.FromSeconds(1.1 / melee.AttackRate);
                 }
             }
 
-            if (RobustaConfig.MeleeAimbotEnabled || RobustaConfig.MeleeTriggerbotEnabled)
-                return false;
-
-            return true;
+            return false;
         }
     }
 }

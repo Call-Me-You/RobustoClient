@@ -12,6 +12,24 @@ namespace RobustoClient.UI;
 public sealed partial class CheatMenuWindow : RobustaWindow
 {
     [Dependency] private readonly IEntityManager _entMan = default!;
+
+    private bool _savePending;
+    private float _saveDebounceTimer;
+    private const float SaveDebounceDelay = 0.5f;
+
+    private void QueueDebouncedSave()
+    {
+        _savePending = true;
+        _saveDebounceTimer = SaveDebounceDelay;
+    }
+
+    private void FlushPendingSave()
+    {
+        if (!_savePending) return;
+        _savePending = false;
+        _saveDebounceTimer = 0f;
+        RobustaConfig.Save();
+    }
     
     public CheatMenuWindow()
     {
@@ -30,6 +48,7 @@ public sealed partial class CheatMenuWindow : RobustaWindow
         Ranged.Pressed = RobustaConfig.RangedAimbotEnabled;
         Melee.Pressed = RobustaConfig.MeleeAimbotEnabled;
         MeleeTrigger.Pressed = RobustaConfig.MeleeTriggerbotEnabled;
+        ThrowAim.Pressed = RobustaConfig.ThrowAimbotEnabled;
         AutoSpin.Pressed = RobustaConfig.SpinBotEnabled;
         AntiSlip.Pressed = RobustaConfig.AntiSlipEnabled;
         SyndicateDetector.Pressed = RobustaConfig.SyndicateDetector;
@@ -41,22 +60,67 @@ public sealed partial class CheatMenuWindow : RobustaWindow
         ItemSearchInput.Text = RobustaConfig.ItemSearchQuery;
         ItemSearchBtn.Pressed = RobustaConfig.ItemSearchEnabled;
         PredictionToggle.Pressed = RobustaConfig.UsePrediction;
+        AimFovInput.Text = RobustaConfig.AimFovPixels.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        MaxLockInput.Text = RobustaConfig.MaxLockDistance.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        SpinSpeedInput.Text = RobustaConfig.SpinBotDegreesPerSecond.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
         // Button Handlers
-        Melee.OnToggled += args => RobustaConfig.MeleeAimbotEnabled = args.Pressed;
-        MeleeTrigger.OnToggled += args => RobustaConfig.MeleeTriggerbotEnabled = args.Pressed;
-        Ranged.OnToggled += args => RobustaConfig.RangedAimbotEnabled = args.Pressed;
-        AutoSpin.OnToggled += args => RobustaConfig.SpinBotEnabled = args.Pressed;
-        AntiSlip.OnToggled += args => RobustaConfig.AntiSlipEnabled = args.Pressed;
-        SyndicateDetector.OnToggled += args => RobustaConfig.SyndicateDetector = args.Pressed;
-        DOD.OnToggled += args => RobustaConfig.FOVDisable = args.Pressed;
-        OverlaysDisable.OnToggled += args => RobustaConfig.OverlaysDisable = args.Pressed;
-        NoRecoil.OnToggled += args => RobustaConfig.NoRecoilEnabled = args.Pressed;
-        FullbrightBtn.OnToggled += args => RobustaConfig.FullbrightEnabled = args.Pressed;
-        EspBtn.OnToggled += args => RobustaConfig.EspEnabled = args.Pressed;
+        Melee.OnToggled += args => { RobustaConfig.MeleeAimbotEnabled = args.Pressed; RobustaConfig.Save(); };
+        MeleeTrigger.OnToggled += args => { RobustaConfig.MeleeTriggerbotEnabled = args.Pressed; RobustaConfig.Save(); };
+        Ranged.OnToggled += args => { RobustaConfig.RangedAimbotEnabled = args.Pressed; RobustaConfig.Save(); };
+        ThrowAim.OnToggled += args => { RobustaConfig.ThrowAimbotEnabled = args.Pressed; RobustaConfig.Save(); };
+        AutoSpin.OnToggled += args => { RobustaConfig.SpinBotEnabled = args.Pressed; RobustaConfig.Save(); };
+        AntiSlip.OnToggled += args =>
+        {
+            if (_entMan.EntitySysManager.TryGetEntitySystem<RobustaAntiSlipSystem>(out var antiSlip))
+                antiSlip.SetEnabled(args.Pressed);
+            RobustaConfig.AntiSlipEnabled = args.Pressed;
+            RobustaConfig.Save();
+        };
+        SyndicateDetector.OnToggled += args => { RobustaConfig.SyndicateDetector = args.Pressed; RobustaConfig.Save(); };
+        DOD.OnToggled += args => { RobustaConfig.FOVDisable = args.Pressed; RobustaConfig.Save(); };
+        OverlaysDisable.OnToggled += args => { RobustaConfig.OverlaysDisable = args.Pressed; RobustaConfig.Save(); };
+        NoRecoil.OnToggled += args => { RobustaConfig.NoRecoilEnabled = args.Pressed; RobustaConfig.Save(); };
+        FullbrightBtn.OnToggled += args => { RobustaConfig.FullbrightEnabled = args.Pressed; RobustaConfig.Save(); };
+        EspBtn.OnToggled += args => { RobustaConfig.EspEnabled = args.Pressed; RobustaConfig.Save(); };
         ItemSearchInput.OnTextChanged += args => RobustaConfig.ItemSearchQuery = args.Text;
         ItemSearchBtn.OnToggled += args => RobustaConfig.ItemSearchEnabled = args.Pressed;
-        PredictionToggle.OnToggled += args => RobustaConfig.UsePrediction = args.Pressed;
+        PredictionToggle.OnToggled += args => { RobustaConfig.UsePrediction = args.Pressed; RobustaConfig.Save(); };
+
+        AimFovInput.OnTextChanged += args =>
+        {
+            if (float.TryParse(args.Text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var val) && val > 0f)
+            {
+                RobustaConfig.AimFovPixels = val;
+                QueueDebouncedSave();
+            }
+        };
+        AimFovInput.OnTextEntered += _ => FlushPendingSave();
+        AimFovInput.OnFocusExit += _ => FlushPendingSave();
+
+        MaxLockInput.OnTextChanged += args =>
+        {
+            if (float.TryParse(args.Text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var val) && val > 0f)
+            {
+                RobustaConfig.MaxLockDistance = val;
+                QueueDebouncedSave();
+            }
+        };
+        MaxLockInput.OnTextEntered += _ => FlushPendingSave();
+        MaxLockInput.OnFocusExit += _ => FlushPendingSave();
+
+        SpinSpeedInput.OnTextChanged += args =>
+        {
+            if (float.TryParse(args.Text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var val))
+            {
+                RobustaConfig.SpinBotDegreesPerSecond = val;
+                QueueDebouncedSave();
+            }
+        };
+        SpinSpeedInput.OnTextEntered += _ => FlushPendingSave();
+        SpinSpeedInput.OnFocusExit += _ => FlushPendingSave();
+
+        OnClose += FlushPendingSave;
         
         ReloadEspBtn.OnPressed += _ => {
             var esp = _entMan.System<RobustoClient.Systems.ESP.EspEvaluator>();
@@ -83,9 +147,23 @@ public sealed partial class CheatMenuWindow : RobustaWindow
         ShowSection(CombatSection);
     }
 
+    protected override void FrameUpdate(Robust.Shared.Timing.FrameEventArgs args)
+    {
+        base.FrameUpdate(args);
+        if (_savePending)
+        {
+            _saveDebounceTimer -= args.DeltaSeconds;
+            if (_saveDebounceTimer <= 0f)
+            {
+                FlushPendingSave();
+            }
+        }
+    }
+
     private void SetPingMode(RobustaConfig.PingMode mode)
     {
         RobustaConfig.CurrentPingMode = mode;
+        RobustaConfig.Save();
         Robust.Shared.Log.Logger.GetSawmill("RobustaAim").Info($"> Ping Mode set to: {mode}");
         UpdatePingButtons();
     }

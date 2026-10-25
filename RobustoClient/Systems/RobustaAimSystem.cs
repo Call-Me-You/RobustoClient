@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Reflection;
@@ -67,7 +68,7 @@ public class RobustaAimSystem : EntitySystem
         }
         else
         {
-            if (!Exists(_lockedTarget.Value) || !FilterEntity(_lockedTarget.Value, Transform(_lockedTarget.Value)))
+            if (!Exists(_lockedTarget.Value) || !FilterEntity(_lockedTarget.Value, Transform(_lockedTarget.Value)) || !IsInRange(localPlayer.Value, _lockedTarget.Value, RobustaConfig.MaxLockDistance))
             {
                 _lockedTarget = null;
             }
@@ -111,7 +112,7 @@ public class RobustaAimSystem : EntitySystem
         var localPlayer = _player.LocalSession?.AttachedEntity;
         if (localPlayer == null) return null;
 
-        if (_lockedTarget.HasValue)
+        if (_lockedTarget.HasValue && Exists(_lockedTarget.Value))
         {
             var lockTransform = Transform(_lockedTarget.Value);
             var lockedPredictedPos = _prediction.GetPredictedAimPoint(localPlayer.Value, _lockedTarget.Value, bulletSpeed, true);
@@ -123,6 +124,8 @@ public class RobustaAimSystem : EntitySystem
                 Velocity = null 
             };
         }
+
+        _lockedTarget = null;
 
         // USE PIXEL FOV
         var target = GetClosestInScreenFov(mousePos, RobustaConfig.AimFovPixels, new HashSet<EntityUid> { localPlayer.Value });
@@ -149,7 +152,7 @@ public class RobustaAimSystem : EntitySystem
             throwSpeed = hands.BaseThrowspeed;
         }
 
-        if (_lockedTarget.HasValue)
+        if (_lockedTarget.HasValue && Exists(_lockedTarget.Value))
         {
             var lockTransform = Transform(_lockedTarget.Value);
             var lockedPredictedPos = _prediction.GetPredictedAimPoint(localPlayer.Value, _lockedTarget.Value, throwSpeed, false);
@@ -161,6 +164,8 @@ public class RobustaAimSystem : EntitySystem
                 Velocity = null 
             };
         }
+
+        _lockedTarget = null;
 
         // USE PIXEL FOV
         var target = GetClosestInScreenFov(mousePos, RobustaConfig.AimFovPixels, new HashSet<EntityUid> { localPlayer.Value });
@@ -181,8 +186,12 @@ public class RobustaAimSystem : EntitySystem
         var mapCoords = _eyeManager.ScreenToMap(mouseScreenPos);
         if (mapCoords.MapId == MapId.Nullspace) return null;
 
-        // Get entities in a wide world radius (20 meters is enough to cover the whole screen)
-        var entitiesInRange = _lookup.GetEntitiesInRange(mapCoords, 20f, LookupFlags.Uncontained);
+        var edgeScreen = new ScreenCoordinates(mouseScreenPos.Position + new Vector2(fovRadiusPixels, 0), mouseScreenPos.Window);
+        var edgeMapCoords = _eyeManager.PixelToMap(edgeScreen);
+        float worldRadius = edgeMapCoords.MapId == mapCoords.MapId
+            ? Math.Clamp((edgeMapCoords.Position - mapCoords.Position).Length() + 1.5f, 2f, 60f)
+            : 20f;
+        var entitiesInRange = _lookup.GetEntitiesInRange(mapCoords, worldRadius, LookupFlags.Uncontained);
         if (exclude != null) entitiesInRange.ExceptWith(exclude);
 
         MapCoordinates? bestCoordinates = null;

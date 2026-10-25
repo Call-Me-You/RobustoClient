@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Reflection;
 using Robust.Client.Graphics;
 using Robust.Shared.Enums;
 using Robust.Shared.GameObjects;
@@ -26,6 +27,7 @@ public sealed class RobustaEspOverlay : Overlay
     private readonly IPlayerManager _player;
     private readonly IEyeManager _eyeManager;
     private readonly Font _font;
+    private readonly EspLayoutManager _layoutManager;
     private readonly SharedTransformSystem _xformSystem;
     private readonly EntityLookupSystem _lookup;
     private readonly EspEvaluator _esp;
@@ -33,6 +35,12 @@ public sealed class RobustaEspOverlay : Overlay
     private readonly RobustaSyndicateDetectorSystem _syndi;
     private readonly InventorySystem _inv;
     private readonly SharedHandsSystem _hands;
+
+    private readonly FieldInfo? _pendingStatesField;
+    private readonly MethodInfo? _getHeldItemMethod3;
+    private readonly MethodInfo? _getHeldItemMethod2;
+    private readonly PropertyInfo? _hasMindProp;
+    private readonly FieldInfo? _hasMindField;
 
     public override OverlaySpace Space => OverlaySpace.ScreenSpace;
 
@@ -50,6 +58,14 @@ public sealed class RobustaEspOverlay : Overlay
         
         var cache = IoCManager.Resolve<IResourceCache>();
         _font = new VectorFont(cache.GetResource<FontResource>("/Fonts/NotoSans/NotoSans-Regular.ttf"), 10);
+        _layoutManager = new EspLayoutManager(_font);
+
+        _pendingStatesField = _player.GetType().GetField("_pendingStates", BindingFlags.NonPublic | BindingFlags.Instance);
+        var handsType = _hands.GetType();
+        _getHeldItemMethod3 = handsType.GetMethod("GetHeldItem", new[] { typeof(Entity<HandsComponent>), typeof(string), typeof(bool) });
+        _getHeldItemMethod2 = handsType.GetMethod("GetHeldItem", new[] { typeof(Entity<HandsComponent>), typeof(string) });
+        _hasMindProp = typeof(MindContainerComponent).GetProperty("HasMind");
+        _hasMindField = typeof(MindContainerComponent).GetField("HasMind");
         
         RegisterHooks();
     }
@@ -64,11 +80,9 @@ public sealed class RobustaEspOverlay : Overlay
             }
             
             var netUid = _entMan.GetNetEntity(uid);
-            var type = _player.GetType();
-            var field = type.GetField("_pendingStates", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            if (field != null)
+            if (_pendingStatesField != null)
             {
-                var pending = field.GetValue(_player) as Dictionary<Robust.Shared.Network.NetUserId, Robust.Shared.GameStates.SessionState>;
+                var pending = _pendingStatesField.GetValue(_player) as Dictionary<Robust.Shared.Network.NetUserId, Robust.Shared.GameStates.SessionState>;
                 if (pending != null)
                 {
                     foreach (var state in pending.Values)
@@ -98,13 +112,11 @@ public sealed class RobustaEspOverlay : Overlay
             foreach (var handName in h.Hands.Keys)
             {
                 EntityUid? held = null;
-                var type = _hands.GetType();
-                var method3 = type.GetMethod("GetHeldItem", new[] { typeof(Entity<HandsComponent>), typeof(string), typeof(bool) });
-                if (method3 != null) held = (EntityUid?)method3.Invoke(_hands, new object?[] { new Entity<HandsComponent>(uid, h), handName, false });
-                else {
-                    var method2 = type.GetMethod("GetHeldItem", new[] { typeof(Entity<HandsComponent>), typeof(string) });
-                    if (method2 != null) held = (EntityUid?)method2.Invoke(_hands, new object?[] { new Entity<HandsComponent>(uid, h), handName });
-                }
+                if (_getHeldItemMethod3 != null)
+                    held = (EntityUid?)_getHeldItemMethod3.Invoke(_hands, new object?[] { new Entity<HandsComponent>(uid, h), handName, false });
+                else if (_getHeldItemMethod2 != null)
+                    held = (EntityUid?)_getHeldItemMethod2.Invoke(_hands, new object?[] { new Entity<HandsComponent>(uid, h), handName });
+
                 if (held != null && _entMan.TryGetComponent<MetaDataComponent>(held.Value, out var heldMeta)) 
                 {
                     if (heldMeta.EntityPrototype?.ID == "VirtualItem" || 
@@ -128,11 +140,8 @@ public sealed class RobustaEspOverlay : Overlay
 
         _esp.RegisterCondition("IsAlive", uid => {
             if (!_entMan.TryGetComponent<MindContainerComponent>(uid, out var mind)) return false;
-            var type = mind.GetType();
-            var prop = type.GetProperty("HasMind");
-            if (prop != null) return (bool)(prop.GetValue(mind) ?? false);
-            var field = type.GetField("HasMind");
-            if (field != null) return (bool)(field.GetValue(mind) ?? false);
+            if (_hasMindProp != null) return (bool)(_hasMindProp.GetValue(mind) ?? false);
+            if (_hasMindField != null) return (bool)(_hasMindField.GetValue(mind) ?? false);
             return false;
         });
 
@@ -171,14 +180,14 @@ public sealed class RobustaEspOverlay : Overlay
             var screenPos = args.ViewportControl?.WorldToScreen(worldPos);
             if (screenPos == null) continue;
 
-            var layout = new EspLayoutManager(screenHandle, _font, screenPos.Value);
+            _layoutManager.Reset(screenHandle, screenPos.Value);
             
             foreach (var res in results)
             {
-                layout.Add(res.Category.Dock, res.RenderText, res.Category.Color, res.Category.Priority);
+                _layoutManager.Add(res.Category.Dock, res.RenderText, res.Category.Color, res.Category.Priority);
             }
 
-            layout.DrawAll();
+            _layoutManager.DrawAll();
         }
     }
 }

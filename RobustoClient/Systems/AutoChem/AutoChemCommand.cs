@@ -1,3 +1,4 @@
+using Content.Shared.Administration;
 using Content.Shared.FixedPoint;
 using Robust.Shared.Console;
 using Robust.Shared.GameObjects;
@@ -8,6 +9,7 @@ namespace RobustoClient.Systems.AutoChem;
 /// <summary>
 /// Console command for launching the automated chemistry system from the game.
 /// </summary>
+[AnyCommand]
 public sealed class AutoChemCommand : IConsoleCommand
 {
     // Command name for the console.

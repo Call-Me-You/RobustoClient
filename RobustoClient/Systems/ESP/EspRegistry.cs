@@ -144,7 +144,7 @@ public sealed class EspRegistry
         }
         catch (Exception ex)
         {
-            Robust.Shared.Log.Logger.ErrorS("ESP", $"Failed to load ESP configs from disk: {ex}");
+            Robust.Shared.Log.Logger.GetSawmill("ESP").Error($"Failed to load ESP configs from disk: {ex}");
             // Fallback to default in memory if file reading fails
             LoadFromString(DefaultConfig);
         }
@@ -174,7 +174,7 @@ public sealed class EspRegistry
         }
         catch (Exception ex)
         {
-            Robust.Shared.Log.Logger.ErrorS("ESP", $"Failed to parse ESP YAML: {ex}");
+            Robust.Shared.Log.Logger.GetSawmill("ESP").Error($"Failed to parse ESP YAML: {ex}");
         }
     }
 

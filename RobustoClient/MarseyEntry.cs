@@ -7,7 +7,9 @@ public static class MarseyEntry
 {
     public static void Entry()
     {
+#if DEBUG
         Harmony.DEBUG = true;
+#endif
         MarseyLogger.Info("Entry for patching started.");
         if (!TryGetAssembly("Content.Client"))
             return;

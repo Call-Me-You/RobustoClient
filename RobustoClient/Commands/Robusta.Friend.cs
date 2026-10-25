@@ -19,7 +19,10 @@ public class RobustaFriendCommand : IConsoleCommand
         }
         
         if (RobustaConfig.FriendsSet.Add(args[0]))
+        {
+            RobustaConfig.Save();
             shell.WriteLine("Username is successfully added");
+        }
         else
             shell.WriteError("Username is already presented");
     }

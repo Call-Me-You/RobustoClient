@@ -37,8 +37,8 @@ public sealed class RobustaPlayerListUpdaterSystem : LocalPlayerSystem
             _lastSessions = _player.SessionsDict;
             return;
         }
-        var leaved = _lastSessions.Keys.Concat(_player.SessionsDict.Keys).Select(key => _lastSessions[key]);
-        var joined = _player.SessionsDict.Keys.Concat(_lastSessions.Keys).Select(key => _player.SessionsDict[key]);
+        var leaved = _lastSessions.Keys.Except(_player.SessionsDict.Keys).Select(key => _lastSessions[key]);
+        var joined = _player.SessionsDict.Keys.Except(_lastSessions.Keys).Select(key => _player.SessionsDict[key]);
         _lastSessions = _player.SessionsDict;
         
         foreach (var leave in leaved)
@@ -74,7 +74,7 @@ public sealed class RobustaPlayerListUpdaterSystem : LocalPlayerSystem
     {
         if (_nextUpdate is null)
             return;
-        if (_timing.CurTime > _nextUpdate)
+        if (_timing.CurTime < _nextUpdate)
             return;
         MarseyLogger.Debug("SENDING");
         _net.ClientSendMessage(new MsgPlayerListReq());

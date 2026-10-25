@@ -30,6 +30,23 @@ public class GunUpdatePatch
     private static IPlayerManager? _player;
     private static RobustaAimSystem? _aim;
 
+    private static readonly string[] HitscanKeywords = ["hitscan", "beam", "instant", "raycast"];
+    private static readonly string[] NameKeywords = ["laser", "pulse", "xray", "ray", "beam"];
+    private static readonly string[] PotentialSpeedNames = ["ProjectileSpeedModified", "ProjectileSpeed", "speed", "_projectileSpeed"];
+    private static readonly HashSet<string> HitscanPrototypes =
+    [
+        "WeaponAntiqueLaser", "WeaponLaserPistol", "WeaponLaserGun", "WeaponLaserCarbine",
+        "WeaponLaserCarbinePractice", "WeaponAdvancedLaser", "WeaponLaserCannon",
+        "WeaponLaserCannonXenoborg", "WeaponLaserGunXenoborg", "WeaponLaserSvalinn",
+        "WeaponMakeshiftLaser", "WeaponBehonkerLaser",
+        "WeaponPulsePistol", "WeaponPulseCarbine", "WeaponPulseRifle",
+        "WeaponHitscanDebug", "WeaponHitscanDebugGib", "RedShuttleLaser"
+    ];
+
+    private static readonly Dictionary<string, bool> ProtoHitscanCache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<Type, (bool IsHitscanComp, PropertyInfo? SpeedProp, FieldInfo? SpeedField)> CompAccessorCache = new();
+    private static readonly HashSet<string> LoggedWeapons = new(StringComparer.OrdinalIgnoreCase);
+
     public static NetCoordinates Patch(NetCoordinates originalCoords)
     {
         _entMan ??= IoCManager.Resolve<IEntityManager>();
@@ -67,89 +84,100 @@ public class GunUpdatePatch
 
                 if (gunUid != null && gunUid.Value.IsValid())
                 {
-                    var gunComps = _entMan.GetComponents(gunUid.Value).ToList();
-                    string gunName = _entMan.ToPrettyString(gunUid.Value);
-                    
+                    _entMan.TryGetComponent<MetaDataComponent>(gunUid.Value, out var meta);
+                    string cacheKey = meta?.EntityPrototype?.ID ?? meta?.EntityName ?? _entMan.ToPrettyString(gunUid.Value);
+
                     bool isHitscan = false;
                     bool speedDetected = false;
                     string detectedInComp = "";
                     float bulletSpeed = RobustaConfig.DefaultProjectileSpeed;
-                    var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                    const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
 
-                    var hitscanKeywords = new[] { "hitscan", "beam", "instant", "raycast" };
-
-                    // 1. DETECTION VIA WEAPON COMPONENTS
-                    foreach (var c in gunComps)
+                    if (ProtoHitscanCache.TryGetValue(cacheKey, out var cachedProtoHitscan) && cachedProtoHitscan)
                     {
-                        string cName = c.GetType().Name.ToLower();
-                        if (hitscanKeywords.Any(kw => cName.Contains(kw)))
+                        isHitscan = true;
+                        detectedInComp = "ProtoCache";
+                    }
+                    else if (!ProtoHitscanCache.ContainsKey(cacheKey))
+                    {
+                        bool protoHitscan = false;
+                        if (meta?.EntityPrototype != null)
+                        {
+                            string pId = meta.EntityPrototype.ID.ToLowerInvariant();
+                            string pName = meta.EntityName.ToLowerInvariant();
+
+                            if (NameKeywords.Any(kw => pId.Contains(kw) || pName.Contains(kw)))
+                            {
+                                protoHitscan = true;
+                                detectedInComp = "NameMatch";
+                            }
+                            else if (HitscanPrototypes.Contains(meta.EntityPrototype.ID))
+                            {
+                                protoHitscan = true;
+                                detectedInComp = "Whitelist";
+                            }
+                        }
+
+                        ProtoHitscanCache[cacheKey] = protoHitscan;
+                        if (protoHitscan)
+                            isHitscan = true;
+                    }
+
+                    // Inspect components using cached accessors so runtime ProjectileSpeedModified changes are respected
+                    foreach (var comp in _entMan.GetComponents(gunUid.Value))
+                    {
+                        var t = comp.GetType();
+                        if (!CompAccessorCache.TryGetValue(t, out var accessor))
+                        {
+                            string cName = t.Name.ToLowerInvariant();
+                            bool isHitscanComp = HitscanKeywords.Any(kw => cName.Contains(kw));
+                            PropertyInfo? speedProp = null;
+                            FieldInfo? speedField = null;
+
+                            foreach (var name in PotentialSpeedNames)
+                            {
+                                speedProp = t.GetProperty(name, flags);
+                                if (speedProp != null) break;
+                                speedField = t.GetField(name, flags);
+                                if (speedField != null) break;
+                            }
+
+                            accessor = (isHitscanComp, speedProp, speedField);
+                            CompAccessorCache[t] = accessor;
+                        }
+
+                        if (!isHitscan && accessor.IsHitscanComp)
                         {
                             isHitscan = true;
-                            detectedInComp = $"Weapon:{c.GetType().Name}";
+                            detectedInComp = $"Weapon:{t.Name}";
                             break;
                         }
-                    }
 
-                    // 2. DETECTION VIA NAME / ID (Primary method for client)
-                    _entMan.TryGetComponent<MetaDataComponent>(gunUid.Value, out var meta);
-                    if (!isHitscan && meta != null && meta.EntityPrototype != null)
-                    {
-                        string pId = meta.EntityPrototype.ID.ToLower();
-                        string pName = meta.EntityName.ToLower();
-                        
-                        var nameKeywords = new[] { "laser", "pulse", "xray", "ray", "beam" };
-                        
-                        if (nameKeywords.Any(kw => pId.Contains(kw) || pName.Contains(kw)))
+                        if (!isHitscan && !speedDetected && (accessor.SpeedProp != null || accessor.SpeedField != null))
                         {
-                            isHitscan = true;
-                            detectedInComp = "NameMatch";
-                        }
-                    }
-
-                    // 3. WHITELIST (Fallback insurance)
-                    if (!isHitscan && meta != null && meta.EntityPrototype != null)
-                    {
-                        var hitscanPrototypes = new HashSet<string> { 
-                            "WeaponAntiqueLaser", "WeaponLaserPistol", "WeaponLaserGun", "WeaponLaserCarbine", 
-                            "WeaponLaserCarbinePractice", "WeaponAdvancedLaser", "WeaponLaserCannon", 
-                            "WeaponLaserCannonXenoborg", "WeaponLaserGunXenoborg", "WeaponLaserSvalinn", 
-                            "WeaponMakeshiftLaser", "WeaponBehonkerLaser",
-                            "WeaponPulsePistol", "WeaponPulseCarbine", "WeaponPulseRifle",
-                            "WeaponHitscanDebug", "WeaponHitscanDebugGib", "RedShuttleLaser"
-                        };
-                        if (hitscanPrototypes.Contains(meta.EntityPrototype.ID))
-                        {
-                            isHitscan = true;
-                            detectedInComp = "Whitelist";
-                        }
-                    }
-
-                    // 4. VELOCITY SEARCH (For Ballistics)
-                    if (!isHitscan)
-                    {
-                        var potentialNames = new[] { "ProjectileSpeedModified", "ProjectileSpeed", "speed", "_projectileSpeed" };
-                        foreach (var comp in gunComps)
-                        {
-                            var t = comp.GetType();
-                            foreach (var name in potentialNames)
+                            var val = accessor.SpeedProp?.GetValue(comp) ?? accessor.SpeedField?.GetValue(comp);
+                            if (val is float f && f > 0f)
                             {
-                                var prop = t.GetProperty(name, flags);
-                                var val = prop?.GetValue(comp) ?? t.GetField(name, flags)?.GetValue(comp);
-                                if (val is float f && f > 0) { bulletSpeed = f; speedDetected = true; detectedInComp = t.Name; break; }
+                                bulletSpeed = f;
+                                speedDetected = true;
+                                detectedInComp = t.Name;
                             }
-                            if (speedDetected) break;
                         }
                     }
 
                     if (bulletSpeed > 150f) isHitscan = true;
 
-                    // LOGGING
-                    if (isHitscan)
-                        Logger.GetSawmill("RobustaAim").Info($"> DETECT: {gunName} | Type: HITSCAN | Src: {detectedInComp}");
-                    else
-                        Logger.GetSawmill("RobustaAim").Info($"> DETECT: {gunName} | Type: BALLISTIC | Speed: {bulletSpeed}m/s ({ (speedDetected ? detectedInComp : "FALLBACK") })");
+                    if (LoggedWeapons.Add(cacheKey))
+                    {
+                        string gunName = _entMan.ToPrettyString(gunUid.Value);
+                        string source = isHitscan ? detectedInComp : (speedDetected ? detectedInComp : "FALLBACK");
+                        if (isHitscan)
+                            Logger.GetSawmill("RobustaAim").Info($"> DETECT: {gunName} | Type: HITSCAN | Src: {source}");
+                        else
+                            Logger.GetSawmill("RobustaAim").Info($"> DETECT: {gunName} | Type: BALLISTIC | Speed: {bulletSpeed}m/s ({source})");
+                    }
 
-                    if (isHitscan) 
+                    if (isHitscan)
                     {
                         return _entMan.GetNetCoordinates(new EntityCoordinates(targetUid, finalOffset));
                     }

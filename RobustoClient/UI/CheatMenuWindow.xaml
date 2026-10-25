@@ -50,8 +50,19 @@
                              <Button ToggleMode="True" Text="Melee Triggerbot" Name="MeleeTrigger" HorizontalExpand="True" />
                         </BoxContainer>
                         <BoxContainer Orientation="Horizontal" SeparationOverride="10">
-                             <Button ToggleMode="True" Text="AutoSpin" Name="AutoSpin" HorizontalExpand="True" />
+                             <Button ToggleMode="True" Text="Throw Aimbot" Name="ThrowAim" HorizontalExpand="True" />
                              <Button ToggleMode="True" Text="No Recoil" Name="NoRecoil" HorizontalExpand="True" />
+                        </BoxContainer>
+                        <BoxContainer Orientation="Horizontal" SeparationOverride="10">
+                             <Button ToggleMode="True" Text="AutoSpin" Name="AutoSpin" HorizontalExpand="True" />
+                        </BoxContainer>
+                        <BoxContainer Orientation="Horizontal" SeparationOverride="10" Margin="0 5 0 0">
+                             <Label Text="FOV (px):" FontColorOverride="#6E7681" VerticalAlignment="Center" />
+                             <LineEdit Name="AimFovInput" MinWidth="60" HorizontalExpand="True" />
+                             <Label Text="Lock Dist (m):" FontColorOverride="#6E7681" VerticalAlignment="Center" />
+                             <LineEdit Name="MaxLockInput" MinWidth="60" HorizontalExpand="True" />
+                             <Label Text="Spin (°/s):" FontColorOverride="#6E7681" VerticalAlignment="Center" />
+                             <LineEdit Name="SpinSpeedInput" MinWidth="60" HorizontalExpand="True" />
                         </BoxContainer>
                     </BoxContainer>
 

@@ -26,8 +26,12 @@ public sealed class RobustaAntiSlipSystem : EntitySystem
 
     public void SetEnabled(bool enabled)
     {
-        if (RobustaConfig.AntiSlipEnabled && !enabled && _forcePressWalk) 
-            PressWalk(BoundKeyState.Down);
+        if (RobustaConfig.AntiSlipEnabled && !enabled && _forcePressWalk)
+        {
+            PressWalk(BoundKeyState.Up);
+            _forcePressWalk = false;
+            _changed = false;
+        }
         RobustaConfig.AntiSlipEnabled = enabled;
     }
 
@@ -36,8 +40,23 @@ public sealed class RobustaAntiSlipSystem : EntitySystem
         base.FrameUpdate(frameTime);
         var player = _playerManager.LocalEntity;
 
-        if (!player.HasValue || !RobustaConfig.AntiSlipEnabled)
+        if (!player.HasValue)
+        {
+            _forcePressWalk = false;
+            _changed = false;
             return;
+        }
+
+        if (!RobustaConfig.AntiSlipEnabled)
+        {
+            if (_forcePressWalk)
+            {
+                _forcePressWalk = false;
+                _changed = false;
+                PressWalk(BoundKeyState.Up);
+            }
+            return;
+        }
         var onSoap = IsPlayerOnSoap(player.Value);
         _changed = onSoap != _forcePressWalk;
         _forcePressWalk = onSoap;
@@ -48,7 +67,7 @@ public sealed class RobustaAntiSlipSystem : EntitySystem
 
     private void PressWalk(BoundKeyState state)
     {
-        if (!_playerManager.LocalEntity.HasValue || !RobustaConfig.AntiSlipEnabled)
+        if (!_playerManager.LocalEntity.HasValue)
             return;
 
         var player = _playerManager.LocalEntity.Value;
@@ -70,9 +89,10 @@ public sealed class RobustaAntiSlipSystem : EntitySystem
 
     private bool IsPlayerOnSoap(EntityUid player)
     {
-        foreach (var entity in _lookup.GetEntitiesInRange(player, 1f, LookupFlags.Uncontained).ToList()
-                     .Where(HasComp<SlipperyComponent>))
+        var entities = _lookup.GetEntitiesInRange(player, 1f, LookupFlags.Uncontained);
+        foreach (var entity in entities)
         {
+            if (!HasComp<SlipperyComponent>(entity)) continue;
             if (!TryComp<StepTriggerComponent>(entity, out var triggerComponent)) continue;
             if (!triggerComponent.Active)
                 continue;

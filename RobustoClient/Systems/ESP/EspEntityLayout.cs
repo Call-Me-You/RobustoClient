@@ -1,5 +1,5 @@
+using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Numerics;
 using Robust.Client.Graphics;
 using Robust.Shared.Maths;
@@ -8,27 +8,41 @@ namespace RobustoClient.Systems.ESP;
 
 public sealed class EspLayoutManager
 {
-    private readonly DrawingHandleScreen _handle;
+    private DrawingHandleScreen? _handle;
     private readonly Font _font;
-    private readonly Vector2 _baseScreenPos;
+    private Vector2 _baseScreenPos;
     
     private readonly List<LayoutElement> _top = new();
     private readonly List<LayoutElement> _bottom = new();
     private readonly List<LayoutElement> _left = new();
     private readonly List<LayoutElement> _right = new();
+    private int _nextOrder;
+
+    private static readonly Comparison<LayoutElement> PriorityDescending = (a, b) =>
+    {
+        int cmp = b.Priority.CompareTo(a.Priority);
+        return cmp != 0 ? cmp : a.Order.CompareTo(b.Order);
+    };
 
     private readonly struct LayoutElement
     {
         public readonly string Text;
         public readonly Color Color;
         public readonly int Priority;
+        public readonly int Order;
 
-        public LayoutElement(string text, Color color, int priority)
+        public LayoutElement(string text, Color color, int priority, int order)
         {
             Text = text;
             Color = color;
             Priority = priority;
+            Order = order;
         }
+    }
+
+    public EspLayoutManager(Font font)
+    {
+        _font = font;
     }
 
     public EspLayoutManager(DrawingHandleScreen handle, Font font, Vector2 baseScreenPos)
@@ -38,9 +52,20 @@ public sealed class EspLayoutManager
         _baseScreenPos = baseScreenPos;
     }
 
+    public void Reset(DrawingHandleScreen handle, Vector2 baseScreenPos)
+    {
+        _handle = handle;
+        _baseScreenPos = baseScreenPos;
+        _nextOrder = 0;
+        _top.Clear();
+        _bottom.Clear();
+        _left.Clear();
+        _right.Clear();
+    }
+
     public void Add(EspDock dock, string text, Color color, int priority)
     {
-        var element = new LayoutElement(text, color, priority);
+        var element = new LayoutElement(text, color, priority, _nextOrder++);
         switch (dock)
         {
             case EspDock.Top: _top.Add(element); break;
@@ -52,37 +77,39 @@ public sealed class EspLayoutManager
 
     public void DrawAll()
     {
+        if (_handle == null) return;
+
         // Top: draw stacking upwards. Highest priority is closest to entity (lowest Y offset)
-        var topSorted = _top.OrderByDescending(e => e.Priority).ToList();
+        _top.Sort(PriorityDescending);
         float currentY = _baseScreenPos.Y - 45f;
-        foreach (var el in topSorted)
+        foreach (var el in _top)
         {
             _handle.DrawString(_font, new Vector2(_baseScreenPos.X - 40f, currentY), el.Text, el.Color);
             currentY -= 12f;
         }
 
         // Bottom: draw stacking downwards.
-        var bottomSorted = _bottom.OrderByDescending(e => e.Priority).ToList();
+        _bottom.Sort(PriorityDescending);
         currentY = _baseScreenPos.Y + 10f;
-        foreach (var el in bottomSorted)
+        foreach (var el in _bottom)
         {
             _handle.DrawString(_font, new Vector2(_baseScreenPos.X - 40f, currentY), el.Text, el.Color);
             currentY += 12f;
         }
 
         // Right: stack downwards from center right
-        var rightSorted = _right.OrderByDescending(e => e.Priority).ToList();
+        _right.Sort(PriorityDescending);
         currentY = _baseScreenPos.Y - 30f;
-        foreach (var el in rightSorted)
+        foreach (var el in _right)
         {
             _handle.DrawString(_font, new Vector2(_baseScreenPos.X + 40f, currentY), el.Text, el.Color);
             currentY += 12f;
         }
 
         // Left: stack downwards from center left
-        var leftSorted = _left.OrderByDescending(e => e.Priority).ToList();
+        _left.Sort(PriorityDescending);
         currentY = _baseScreenPos.Y - 30f;
-        foreach (var el in leftSorted)
+        foreach (var el in _left)
         {
             // Simple offset, ideally would measure string width
             _handle.DrawString(_font, new Vector2(_baseScreenPos.X - 80f, currentY), el.Text, el.Color);

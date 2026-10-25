@@ -19,7 +19,10 @@ public class RobustaUnfriendCommand : IConsoleCommand
         }
         
         if (RobustaConfig.FriendsSet.Remove(args[0]))
+        {
+            RobustaConfig.Save();
             shell.WriteLine("Username is successfully removed");
+        }
         else
             shell.WriteError("Username is not presented in friend-list");
     }

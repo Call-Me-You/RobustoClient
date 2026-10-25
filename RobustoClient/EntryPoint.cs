@@ -10,6 +10,7 @@ public sealed class EntryPoint : GameShared
 
     public override void PostInit()
     {
+        RobustaConfig.Load();
         MarseyLogger.Debug("Building graph...");
         IoCManager.BuildGraph();
         MarseyLogger.Debug("Graph success built!");

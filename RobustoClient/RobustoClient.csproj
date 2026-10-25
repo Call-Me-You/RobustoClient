@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
     <Import Project="..\MSBuild\XamlIL.targets" />
     <PropertyGroup>
         <TargetFramework>net10.0</TargetFramework>
@@ -63,18 +63,14 @@
             <Private>False</Private>
             <PrivateAssets>all</PrivateAssets>
         </ProjectReference>
-        <ProjectReference Include="..\space-station-14\RobustToolbox\Avalonia.Base\Avalonia.Base.csproj">
-            <Name>Avalonia.Base</Name>
-            <Private>False</Private>
-            <PrivateAssets>all</PrivateAssets>
-        </ProjectReference>
         <ProjectReference Include="..\space-station-14\RobustToolbox\Robust.LoaderApi\Robust.LoaderApi\Robust.LoaderApi.csproj">
             <Name>Robust.LoaderApi</Name>
             <Private>False</Private>
             <PrivateAssets>all</PrivateAssets>
         </ProjectReference>
-        <ProjectReference Include="..\space-station-14\RobustToolbox\OpenToolkit.GraphicsLibraryFramework\OpenToolkit.GraphicsLibraryFramework.csproj">
-            <Name>OpenToolkit.GraphicsLibraryFramework.pdb</Name>
+        <ProjectReference Include="..\space-station-14\RobustToolbox\OpenToolkit.GraphicsLibraryFramework\OpenToolkit.GraphicsLibraryFramework.csproj"
+                          Condition="Exists('..\space-station-14\RobustToolbox\OpenToolkit.GraphicsLibraryFramework\OpenToolkit.GraphicsLibraryFramework.csproj')">
+            <Name>OpenToolkit.GraphicsLibraryFramework</Name>
             <Private>False</Private>
             <PrivateAssets>all</PrivateAssets>
         </ProjectReference>

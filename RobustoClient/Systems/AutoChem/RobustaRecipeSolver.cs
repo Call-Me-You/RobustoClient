@@ -151,36 +151,51 @@ public static class RobustaRecipeSolver
         return (float)Math.Round(bestCycles * yieldPerCycle, 2);
     }
 
-    private static float CalculateRecursiveLCM(string reagentId)
+    private static float CalculateRecursiveLCM(string reagentId, HashSet<string>? visited = null)
     {
         if (DispenserReagents.Contains(reagentId)) return 1f;
-        
-        var recipe = RobustaChemDatabase.GetRecipe(reagentId);
-        if (recipe == null) return 1f;
 
-        float yield = RobustaChemDatabase.GetProductYield(recipe, reagentId);
-        long currentLCM = 1;
+        visited ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!visited.Add(reagentId)) return 1f;
 
-        if (Math.Abs(yield % 1.0f) > 0.001f) currentLCM = LCM(currentLCM, 10);
-
-        foreach (var r in RobustaChemDatabase.GetReactants(recipe))
+        try
         {
-            if (r.Catalyst) continue;
+            var recipe = RobustaChemDatabase.GetRecipe(reagentId);
+            if (recipe == null) return 1f;
 
-            if (Math.Abs(r.Amount % 1.0f) > 0.001f)
-                currentLCM = LCM(currentLCM, 10);
+            float yield = RobustaChemDatabase.GetProductYield(recipe, reagentId);
+            long currentLCM = 1;
 
-            if (!DispenserReagents.Contains(r.Id))
+            if (Math.Abs(yield % 1.0f) > 0.001f) currentLCM = LCM(currentLCM, 10);
+
+            foreach (var r in RobustaChemDatabase.GetReactants(recipe))
             {
-                float preLCM = CalculateRecursiveLCM(r.Id);
-                currentLCM = LCM(currentLCM, (long)Math.Ceiling(preLCM));
-            }
-        }
+                if (r.Catalyst) continue;
 
-        return (float)currentLCM;
+                if (Math.Abs(r.Amount % 1.0f) > 0.001f)
+                    currentLCM = LCM(currentLCM, 10);
+
+                if (!DispenserReagents.Contains(r.Id))
+                {
+                    float preLCM = CalculateRecursiveLCM(r.Id, visited);
+                    currentLCM = LCM(currentLCM, (long)Math.Ceiling(preLCM));
+                }
+            }
+
+            return (float)currentLCM;
+        }
+        finally
+        {
+            visited.Remove(reagentId);
+        }
     }
 
-    private static bool ResolveRecursive(string reagentId, float cycles, DispensePlan plan)
+    private static bool ResolveRecursive(
+        string reagentId,
+        float cycles,
+        DispensePlan plan,
+        HashSet<string>? visited = null,
+        Dictionary<string, float>? catalystTracker = null)
     {
         cycles = (float)Math.Ceiling(cycles);
 
@@ -192,64 +207,102 @@ public static class RobustaRecipeSolver
             return true;
         }
 
-        var recipe = RobustaChemDatabase.GetRecipe(reagentId);
-        if (recipe == null) return true;
+        visited ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        catalystTracker ??= new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+        if (!visited.Add(reagentId)) return false;
 
-        // 1. First, satisfy all sub-reactions
-        foreach (var r in RobustaChemDatabase.GetReactants(recipe))
+        try
         {
-            if (r.Catalyst) continue;
+            var recipe = RobustaChemDatabase.GetRecipe(reagentId);
+            if (recipe == null) return true;
 
-            if (!DispenserReagents.Contains(r.Id))
+            // 1. First, satisfy all sub-reactions
+            foreach (var r in RobustaChemDatabase.GetReactants(recipe))
             {
-                var preRecipe = RobustaChemDatabase.GetRecipe(r.Id);
-                float preYield = preRecipe != null ? RobustaChemDatabase.GetProductYield(preRecipe, r.Id) : 1f;
-                float neededPreAmount = cycles * r.Amount;
-                float neededPreCycles = neededPreAmount / preYield;
-                if (!ResolveRecursive(r.Id, neededPreCycles, plan)) return false;
+                if (!DispenserReagents.Contains(r.Id))
+                {
+                    var preRecipe = RobustaChemDatabase.GetRecipe(r.Id);
+                    float preYield = preRecipe != null ? RobustaChemDatabase.GetProductYield(preRecipe, r.Id) : 1f;
+                    float neededPreAmount;
+                    if (r.Catalyst)
+                    {
+                        catalystTracker.TryGetValue(r.Id, out var existingCatalystAmt);
+                        float neededCatalystDelta = r.Amount - existingCatalystAmt;
+                        if (neededCatalystDelta <= 0.001f)
+                            continue;
+                        catalystTracker[r.Id] = r.Amount;
+                        neededPreAmount = neededCatalystDelta;
+                    }
+                    else
+                    {
+                        neededPreAmount = cycles * r.Amount;
+                    }
+
+                    float neededPreCycles = neededPreAmount / preYield;
+                    if (!ResolveRecursive(r.Id, neededPreCycles, plan, visited, catalystTracker)) return false;
+                }
             }
-        }
 
-        // 2. Group dispenser ingredients
-        var synthesisPhase = new ChemPhase 
-        { 
-            Type = PhaseType.Dispense, 
-            Description = $"Synthesis: {reagentId}",
-            TargetProduct = reagentId
-        };
+            // 2. Group dispenser ingredients
+            var synthesisPhase = new ChemPhase 
+            { 
+                Type = PhaseType.Dispense, 
+                Description = $"Synthesis: {reagentId}",
+                TargetProduct = reagentId
+            };
 
-        foreach (var r in RobustaChemDatabase.GetReactants(recipe))
-        {
-            if (DispenserReagents.Contains(r.Id) || r.Catalyst)
+            foreach (var r in RobustaChemDatabase.GetReactants(recipe))
             {
-                float amount = r.Amount;
-                if (!r.Catalyst) amount *= cycles;
-                
-                synthesisPhase.Ingredients[r.Id] = FixedPoint2.New(amount);
-            }
-        }
-        
-        if (synthesisPhase.Ingredients.Count > 0)
-            plan.RawPhases.Add(synthesisPhase);
+                if (DispenserReagents.Contains(r.Id))
+                {
+                    float amount;
+                    if (r.Catalyst)
+                    {
+                        catalystTracker.TryGetValue(r.Id, out var existingCatalystAmt);
+                        float neededCatalystDelta = r.Amount - existingCatalystAmt;
+                        if (neededCatalystDelta <= 0.001f)
+                            continue;
+                        catalystTracker[r.Id] = r.Amount;
+                        amount = neededCatalystDelta;
+                    }
+                    else
+                    {
+                        amount = r.Amount * cycles;
+                    }
 
-        if (RobustaChemDatabase.RequiresHeating(recipe))
-        {
+                    if (synthesisPhase.Ingredients.ContainsKey(r.Id))
+                        synthesisPhase.Ingredients[r.Id] += FixedPoint2.New(amount);
+                    else
+                        synthesisPhase.Ingredients[r.Id] = FixedPoint2.New(amount);
+                }
+            }
+            
+            if (synthesisPhase.Ingredients.Count > 0)
+                plan.RawPhases.Add(synthesisPhase);
+
+            if (RobustaChemDatabase.RequiresHeating(recipe))
+            {
+                plan.RawPhases.Add(new ChemPhase {
+                    Type = PhaseType.Heat,
+                    TargetTemperature = recipe.MinimumTemperature,
+                    Description = $"Heat for {reagentId}",
+                    TargetProduct = reagentId
+                });
+            }
+
+            // 3. ADD SEPARATE WAIT PHASE
             plan.RawPhases.Add(new ChemPhase {
-                Type = PhaseType.Heat,
-                TargetTemperature = recipe.MinimumTemperature,
-                Description = $"Heat for {reagentId}",
+                Type = PhaseType.Wait,
+                WaitReagents = new List<string> { reagentId },
+                Description = $"Wait for {reagentId}",
                 TargetProduct = reagentId
             });
+
+            return true;
         }
-
-        // 3. ADD SEPARATE WAIT PHASE
-        plan.RawPhases.Add(new ChemPhase {
-            Type = PhaseType.Wait,
-            WaitReagents = new List<string> { reagentId },
-            Description = $"Wait for {reagentId}",
-            TargetProduct = reagentId
-        });
-
-        return true;
+        finally
+        {
+            visited.Remove(reagentId);
+        }
     }
 }
