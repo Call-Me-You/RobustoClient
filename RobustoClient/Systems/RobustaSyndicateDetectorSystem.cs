@@ -4,8 +4,8 @@ using System.Linq;
 using Content.Shared.Store.Components;
 using Content.Shared.StoreDiscount.Components;
 using Content.Shared.Tag;
-using Content.Shared.Contraband; 
-using Content.Shared.PDA;  
+using Content.Shared.Contraband;
+using Content.Shared.PDA;
 using Robust.Shared.GameObjects;
 using Robust.Shared.IoC;
 using Robust.Shared.Timing;
@@ -24,13 +24,12 @@ public sealed class RobustaSyndicateDetectorSystem : EntitySystem
     private readonly Dictionary<EntityUid, (bool Uplink, bool Contra, List<ImplantInfo> Implants, TimeSpan LastCheck)> _cache = new();
     private readonly TimeSpan _cacheLifetime = TimeSpan.FromSeconds(1);
 
-    // Set of currencies that 100% belong to antagonists
-    private readonly HashSet<string> _antagCurrencies = new()  
-    {  
-        "Telecrystal", 
-        "StolenEssence", 
-        "WizCoin", 
-        "ChangelingDNA"  
+    private readonly HashSet<string> _antagCurrencies = new()
+    {
+        "Telecrystal",
+        "StolenEssence",
+        "WizCoin",
+        "ChangelingDNA"
     };
 
     public (bool Uplink, bool Contra, List<ImplantInfo> Implants) CheckPlayerStatus(EntityUid uid)
@@ -48,7 +47,7 @@ public sealed class RobustaSyndicateDetectorSystem : EntitySystem
         var scannedEntities = new HashSet<EntityUid>();
 
         ScanEntity(uid, ref hasUplink, ref hasContra, scannedEntities);
-        
+
         // --- IMPLANT SCANNER ---
         if (TryComp<ImplantedComponent>(uid, out var implanted))
         {
@@ -64,9 +63,8 @@ public sealed class RobustaSyndicateDetectorSystem : EntitySystem
                         var name = meta.EntityName.Replace(" implant", "");
                         string category = "Neutral";
 
-                        // SYNDICATE IMPLANTS
-                        if (id.Contains("Uplink") || id.Contains("MicroBomb") || id.Contains("MacroBomb") || 
-                            id.Contains("Emp") || id.Contains("Scram") || id.Contains("Freedom") || 
+                        if (id.Contains("Uplink") || id.Contains("MicroBomb") || id.Contains("MacroBomb") ||
+                            id.Contains("Emp") || id.Contains("Scram") || id.Contains("Freedom") ||
                             id.Contains("Storage") || id.Contains("VoiceMask") || id.Contains("DnaScrambler") ||
                             id.Contains("Chameleon") || id.Contains("DeathAcidifier") || id.Contains("DeathRattleImplant") && !id.Contains("Centcomm") ||
                             id.Contains("FakeMindShield"))
@@ -74,7 +72,6 @@ public sealed class RobustaSyndicateDetectorSystem : EntitySystem
                             category = "Syndicate";
                             if (id.Contains("Uplink")) hasUplink = true;
                         }
-                        // NANOTRASEN / CENTCOMM IMPLANTS
                         else if (id.Contains("MindShield") || id.Contains("Tracking") || id.Contains("Centcomm"))
                         {
                             category = "NT";
@@ -86,7 +83,6 @@ public sealed class RobustaSyndicateDetectorSystem : EntitySystem
                 }
             }
 
-            // FALLBACK: If component exists but no specifics (or server doesn't send entities inside the container)
             if (!foundSpecific)
             {
                 implants.Add(new ImplantInfo("Unknown Implant", "Neutral"));
@@ -99,7 +95,6 @@ public sealed class RobustaSyndicateDetectorSystem : EntitySystem
 
     private bool CheckUplink(EntityUid target)
     {
-        // 1. Check for the presence of a store and its balance
         if (TryComp<StoreComponent>(target, out var store))
         {
             foreach (var currencyPair in store.Balance)
@@ -111,7 +106,6 @@ public sealed class RobustaSyndicateDetectorSystem : EntitySystem
             }
         }
 
-        // 2. Check for hidden discounts
         if (TryComp<StoreDiscountComponent>(target, out var discountComponent))
         {
             foreach (var discount in discountComponent.Discounts)
@@ -127,20 +121,24 @@ public sealed class RobustaSyndicateDetectorSystem : EntitySystem
 
     private bool IsSyndicateContraband(EntityUid item)
     {
-        if (TryComp<ContrabandComponent>(item, out var contra) && contra.Severity == "Syndicate")
-            return true;
-
-        if (_tagSystem.HasTag(item, "Syndicate"))
-            return true;
-
         if (TryComp<MetaDataComponent>(item, out var meta) && meta.EntityPrototype != null)
         {
             var id = meta.EntityPrototype.ID.ToLower();
-            if ((id.Contains("syndicate") || id.Contains("emag") || id.Contains("esword") || id.Contains("c4") || id.Contains("stealthbox"))  
-                && !id.Contains("poster") && !id.Contains("toy") && !id.Contains("plushie"))
-            {
+
+            // Exclude action entities and non-contraband structures/props
+            if (id.StartsWith("action") || id.Contains("airlocksyndicateglass") || id.Contains("poster") || id.Contains("toy") || id.Contains("plushie"))
+                return false;
+
+            if (TryComp<ContrabandComponent>(item, out var contra) && contra.Severity == "Syndicate")
                 return true;
-            }
+
+            if (_tagSystem.HasTag(item, "Syndicate"))
+                return true;
+
+            bool isEmag = id.StartsWith("emag") || id.Contains("_emag") || id.Contains("emag_") || id == "emag";
+
+            if (id.Contains("syndicate") || isEmag || id.Contains("esword") || id.Contains("c4") || id.Contains("stealthbox"))
+                return true;
         }
 
         return false;
@@ -148,17 +146,20 @@ public sealed class RobustaSyndicateDetectorSystem : EntitySystem
 
     private void ScanEntity(EntityUid parent, ref bool hasUplink, ref bool hasContraband, HashSet<EntityUid> scanned, int depth = 0)
     {
-        if (depth > 5) return; 
-        if (hasUplink && hasContraband) return; 
-        if (!scanned.Add(parent)) return; 
+        if (depth > 5) return;
+        if (hasUplink && hasContraband) return;
+        if (!scanned.Add(parent)) return;
 
         if (!hasUplink && CheckUplink(parent)) hasUplink = true;
         if (!hasContraband && IsSyndicateContraband(parent)) hasContraband = true;
 
         if (TryComp<ContainerManagerComponent>(parent, out var containerManager))
         {
-            foreach (var container in containerManager.Containers.Values)
+            foreach (var (cId, container) in containerManager.Containers)
             {
+                if (cId.Equals("actions", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
                 foreach (var entity in container.ContainedEntities)
                 {
                     ScanEntity(entity, ref hasUplink, ref hasContraband, scanned, depth + 1);
