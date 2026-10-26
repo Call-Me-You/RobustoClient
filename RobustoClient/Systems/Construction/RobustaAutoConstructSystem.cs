@@ -143,7 +143,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             return;
         }
 
-        // Start short window to distinguish 1 short tap (Build) vs double-tap / long-hold (Deconstruct)
+        // Start short window to distinguish 1 short tap (Build/Auto) vs double-tap / long-hold (Deconstruct)
         _pendingSingleTap = true;
         _singleTapTimer = DoubleTapOrHoldWindow;
     }
@@ -196,7 +196,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         }
         else if (forceDeconstruct == false)
         {
-            plan = _solver.SolveBuildPlan(target.Value);
+            plan = _solver.SolveBuildPlan(target.Value) ?? _solver.SolveDeconstructPlan(target.Value);
         }
         else
         {
@@ -368,9 +368,9 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 _pendingSingleTap = false;
                 _singleTapTimer = 0f;
                 // If user is still holding the key at the end of the window -> Long-press Deconstruct;
-                // otherwise -> Short-tap Build!
+                // otherwise -> Auto-detect (builds ghosts/unfinished frames, deconstructs completed structures)
                 bool isHolding = _input.IsKeyDown(RobustaConfig.AutoConstructKey);
-                TriggerAtCursor(forceDeconstruct: isHolding);
+                TriggerAtCursor(forceDeconstruct: isHolding ? true : null);
                 return;
             }
         }
@@ -384,9 +384,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             return;
         }
 
-        if (_itemUtil.IsBusy)
-            return;
-
+        // Check DoAfter state BEFORE _itemUtil.IsBusy so short DoAfters starting during post-click delay are never missed
         if (IsPlayerInActiveDoAfter(player))
         {
             _wasInDoAfter = true;
@@ -399,6 +397,9 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             _wasInDoAfter = false;
             _waitTimer = Math.Max(_waitTimer, 0.35f);
         }
+
+        if (_itemUtil.IsBusy)
+            return;
 
         if (_waitTimer > 0f)
         {
@@ -613,7 +614,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             return;
         }
 
-        // Track target across entity replacements (e.g. Ghost -> Girder -> WallSolid, or WallSolid -> Girder)
+        // Track target across entity replacements (e.g. Ghost -> Girder -> WallSolid, Console -> ComputerFrame, or WallSolid -> Girder)
         if (!Exists(_currentTarget) || Deleted(_currentTarget))
         {
             if (TryRelocateTargetEntity(out var replacement))
@@ -623,7 +624,12 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 _targetMapCoords = _transform.GetMapCoordinates(replacement);
                 _rescanTimer = 0f;
                 _stepRetryCount = 0;
-                AdvancePastAlreadyReachedNodes();
+
+                if (_phase == StepExecutionPhase.WaitForCompletion)
+                {
+                    AdvanceStepOnEntityReplacement();
+                }
+
                 if (_activePlan == null || _stepIndex >= _activePlan.Steps.Count)
                 {
                     _log.Info("AutoConstruct plan completed after entity replacement.");
@@ -661,6 +667,17 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         }
 
         var step = _activePlan.Steps[_stepIndex];
+
+        // Skip redundant wire-panel open step if panel is already open
+        if (step.Kind == ConstructionActionKind.UseTool &&
+            step.Description.StartsWith("Open wire panel", StringComparison.OrdinalIgnoreCase) &&
+            Exists(_currentTarget) &&
+            IsWirePanelOpen(_currentTarget))
+        {
+            _stepIndex++;
+            _phase = StepExecutionPhase.PrepareAndEquip;
+            return;
+        }
 
         // Skip redundant anchor/unanchor step if entity is already in the desired anchored state
         if (step.Kind == ConstructionActionKind.UseTool &&
@@ -784,8 +801,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         _targetMapCoords = _transform.GetMapCoordinates(spawnedStructure);
                         _rescanTimer = 0f;
                         _stepRetryCount = 0;
-                        _stepIndex++;
-                        AdvancePastAlreadyReachedNodes();
+                        AdvancePastGhostStartSteps();
                         _phase = StepExecutionPhase.PrepareAndEquip;
                         return;
                     }
@@ -814,23 +830,47 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
                     if (!_sawDoAfterForStep)
                     {
-                        bool nodeAlreadyChanged = false;
-                        if (Exists(_currentTarget) &&
+                        bool stepAlreadyProgressed = !Exists(_currentTarget) ||
+                                                     Deleted(_currentTarget) ||
+                                                     _currentTarget != _stepStartTarget;
+
+                        if (!stepAlreadyProgressed &&
+                            step.Kind == ConstructionActionKind.UseTool &&
+                            string.Equals(step.PrototypeOrQualityOrTag, "Anchoring", StringComparison.OrdinalIgnoreCase) &&
+                            Exists(_currentTarget))
+                        {
+                            bool isAnchored = Transform(_currentTarget).Anchored;
+                            bool wantsUnanchor = step.Description.StartsWith("Unanchor", StringComparison.OrdinalIgnoreCase);
+                            bool wantsAnchor = step.Description.StartsWith("Anchor frame", StringComparison.OrdinalIgnoreCase);
+                            if ((wantsUnanchor && !isAnchored) || (wantsAnchor && isAnchored))
+                                stepAlreadyProgressed = true;
+                        }
+
+                        if (!stepAlreadyProgressed &&
+                            step.Description.StartsWith("Open wire panel", StringComparison.OrdinalIgnoreCase) &&
+                            Exists(_currentTarget) &&
+                            IsWirePanelOpen(_currentTarget))
+                        {
+                            stepAlreadyProgressed = true;
+                        }
+
+                        if (!stepAlreadyProgressed &&
+                            Exists(_currentTarget) &&
                             _solver.TryResolveGraphAndNode(_currentTarget, out _, out var checkNode, out _) &&
                             checkNode != null &&
                             !string.IsNullOrEmpty(step.ExpectedNextNode) &&
                             !string.Equals(step.ExpectedNextNode, _stepStartNode, StringComparison.OrdinalIgnoreCase) &&
                             string.Equals(checkNode.Name, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase))
                         {
-                            nodeAlreadyChanged = true;
+                            stepAlreadyProgressed = true;
                         }
 
-                        if (!nodeAlreadyChanged && _stepWaitElapsed < Math.Min(0.85f, step.DoAfterDelay + 0.4f))
+                        if (!stepAlreadyProgressed && _stepWaitElapsed < Math.Min(0.85f, step.DoAfterDelay + 0.4f))
                         {
                             return;
                         }
 
-                        if (!nodeAlreadyChanged && step.DoAfterDelay >= 0.45f)
+                        if (!stepAlreadyProgressed && step.DoAfterDelay >= 0.45f)
                         {
                             _stepRetryCount++;
                             if (_stepRetryCount <= 3)
@@ -853,6 +893,29 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         if (_postDoAfterTimer < 0.25f)
                             return;
                     }
+                }
+
+                // Verify WirePanel open transitions actually took effect before advancing
+                if (step.Kind == ConstructionActionKind.UseTool &&
+                    step.Description.StartsWith("Open wire panel", StringComparison.OrdinalIgnoreCase) &&
+                    Exists(_currentTarget) &&
+                    !IsWirePanelOpen(_currentTarget))
+                {
+                    _rescanTimer += frameTime;
+                    if (_rescanTimer >= 0.6f)
+                    {
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        if (_stepRetryCount <= 3)
+                        {
+                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            return;
+                        }
+
+                        _log.Warning($"Step '{step.Description}' did not open wire panel after retries; stopping job.");
+                        FinishCurrentPlan();
+                    }
+                    return;
                 }
 
                 // Verify Unanchor / Anchor transitions actually took effect before advancing
@@ -884,40 +947,48 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     }
                 }
 
-                // If this step is the final step of an edge that replaces/deletes the entity (e.g. target node, start, or girder), wait for replacement
-                bool expectsEntityReplacement =
+                // If this step is the final step of an edge that replaces/deletes the entity
+                // (e.g. Console -> ComputerFrame, Machine -> MachineFrame, Wall -> Girder, or -> start),
+                // wait for the entity replacement before advancing.
+                bool isFinalStepOfEdge =
                     !string.IsNullOrEmpty(step.ExpectedNextNode) &&
-                    !string.Equals(step.ExpectedNextNode, _stepStartNode, StringComparison.OrdinalIgnoreCase) &&
                     (_stepIndex + 1 >= _activePlan.Steps.Count ||
-                     !string.Equals(_activePlan.Steps[_stepIndex + 1].ExpectedNextNode, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase)) &&
-                    (string.Equals(step.ExpectedNextNode, _activePlan.TargetNode, StringComparison.OrdinalIgnoreCase) ||
-                     string.Equals(step.ExpectedNextNode, "start", StringComparison.OrdinalIgnoreCase) ||
-                     string.Equals(step.ExpectedNextNode, "girder", StringComparison.OrdinalIgnoreCase));
+                     !string.Equals(_activePlan.Steps[_stepIndex + 1].ExpectedNextNode, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase));
+
+                bool expectsEntityReplacement =
+                    isFinalStepOfEdge &&
+                    Exists(_currentTarget) &&
+                    _solver.DoesEdgeReplaceOrDeleteEntity(_currentTarget, _activePlan.GraphId, step.ExpectedNextNode);
 
                 if (expectsEntityReplacement && Exists(_currentTarget) && _currentTarget == _stepStartTarget)
                 {
-                    var curNodeName = _solver.TryResolveGraphAndNode(_currentTarget, out _, out var cNode, out _) && cNode != null
-                        ? cNode.Name
-                        : null;
-
-                    if (!string.Equals(curNodeName, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase))
+                    if (TryRelocateReplacementEntity(_stepStartTarget, out var spawnedReplacement))
                     {
-                        _rescanTimer += frameTime;
-                        if (_rescanTimer >= 0.85f)
-                        {
-                            _rescanTimer = 0f;
-                            _stepRetryCount++;
-                            if (_stepRetryCount <= 3)
-                            {
-                                _phase = StepExecutionPhase.PrepareAndEquip;
-                                return;
-                            }
-
-                            _log.Warning($"Step '{step.Description}' did not transition to node '{step.ExpectedNextNode}' after retries; stopping job.");
-                            FinishCurrentPlan();
-                        }
+                        _currentTarget = spawnedReplacement;
+                        _targetCoordinates = Transform(spawnedReplacement).Coordinates;
+                        _targetMapCoords = _transform.GetMapCoordinates(spawnedReplacement);
+                        _stepIndex++;
+                        _rescanTimer = 0f;
+                        _stepRetryCount = 0;
+                        _phase = StepExecutionPhase.PrepareAndEquip;
                         return;
                     }
+
+                    _rescanTimer += frameTime;
+                    if (_rescanTimer >= 0.85f)
+                    {
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        if (_stepRetryCount <= 3)
+                        {
+                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            return;
+                        }
+
+                        _log.Warning($"Step '{step.Description}' did not transition to node '{step.ExpectedNextNode}' after retries; stopping job.");
+                        FinishCurrentPlan();
+                    }
+                    return;
                 }
 
                 _stepIndex++;
@@ -929,34 +1000,60 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         }
     }
 
-    private void AdvancePastAlreadyReachedNodes()
+    private void AdvancePastGhostStartSteps()
     {
-        if (_activePlan == null || !Exists(_currentTarget))
+        if (_activePlan == null || _stepIndex >= _activePlan.Steps.Count)
             return;
 
-        if (!_solver.TryResolveGraphAndNode(_currentTarget, out _, out var actualNode, out _) || actualNode == null)
+        var ghostStep = _activePlan.Steps[_stepIndex];
+        var firstNode = ghostStep.ExpectedNextNode;
+        _stepIndex++;
+
+        if (string.IsNullOrEmpty(firstNode))
             return;
 
-        var actualNodeName = actualNode.Name;
-        if (string.IsNullOrEmpty(actualNodeName))
-            return;
-
-        // Advance past all contiguous steps that were part of the transition INTO actualNodeName,
-        // stopping before any synthetic Anchoring step (ExpectedNextNode == null) or the next edge.
-        for (int i = _stepIndex; i < _activePlan.Steps.Count; i++)
+        while (_stepIndex < _activePlan.Steps.Count &&
+               string.Equals(_activePlan.Steps[_stepIndex].ExpectedNextNode, firstNode, StringComparison.OrdinalIgnoreCase))
         {
-            if (string.Equals(_activePlan.Steps[i].ExpectedNextNode, actualNodeName, StringComparison.OrdinalIgnoreCase))
+            _stepIndex++;
+        }
+    }
+
+    private void AdvanceStepOnEntityReplacement()
+    {
+        if (_activePlan == null || _stepIndex >= _activePlan.Steps.Count)
+            return;
+
+        var curStep = _activePlan.Steps[_stepIndex];
+        if (curStep.Kind == ConstructionActionKind.StartGhostConstruction)
+        {
+            AdvancePastGhostStartSteps();
+            return;
+        }
+
+        // In SS14, an entity replacement occurs when an edge finishes and arrives at curStep.ExpectedNextNode.
+        // Advance past the current step (and any remaining steps belonging to that same completed edge),
+        // without guessing future nodes on multi-node frames like ComputerFrame.
+        var completedEdgeTarget = curStep.ExpectedNextNode;
+        _stepIndex++;
+        if (!string.IsNullOrEmpty(completedEdgeTarget))
+        {
+            while (_stepIndex < _activePlan.Steps.Count &&
+                   string.Equals(_activePlan.Steps[_stepIndex].ExpectedNextNode, completedEdgeTarget, StringComparison.OrdinalIgnoreCase))
             {
-                int nextIdx = i + 1;
-                while (nextIdx < _activePlan.Steps.Count &&
-                       string.Equals(_activePlan.Steps[nextIdx].ExpectedNextNode, actualNodeName, StringComparison.OrdinalIgnoreCase))
-                {
-                    nextIdx++;
-                }
-                _stepIndex = nextIdx;
-                return;
+                _stepIndex++;
             }
         }
+    }
+
+    private bool IsWirePanelOpen(EntityUid uid)
+    {
+        foreach (var comp in EntityManager.GetComponents(uid))
+        {
+            if (string.Equals(comp.GetType().Name, "WiresPanelComponent", StringComparison.OrdinalIgnoreCase))
+                return GetBoolMember(comp, "Open");
+        }
+        return true;
     }
 
     private bool PrepareAndEquipForStep(EntityUid player, ConstructionActionStep step)
@@ -1019,9 +1116,21 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     return false;
 
                 return _itemUtil.TryEquipByPredicate(
-                    uid => EntityManager.GetComponents(uid).Any(c =>
-                        c.GetType().Name.Equals(compName, StringComparison.OrdinalIgnoreCase) ||
-                        c.GetType().Name.Equals(compName + "Component", StringComparison.OrdinalIgnoreCase)),
+                    uid =>
+                    {
+                        if (EntityManager.GetComponents(uid).Any(c =>
+                                c.GetType().Name.Equals(compName, StringComparison.OrdinalIgnoreCase) ||
+                                c.GetType().Name.Equals(compName + "Component", StringComparison.OrdinalIgnoreCase)))
+                        {
+                            return true;
+                        }
+
+                        var proto = MetaData(uid).EntityPrototype;
+                        if (proto != null && _itemUtil.HasPrototypeComponent(proto, compName))
+                            return true;
+
+                        return _tagSystem.HasTag(uid, compName);
+                    },
                     $"Component:{compName}",
                     step.Amount);
             }
@@ -1110,7 +1219,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
         foreach (var uid in nearby)
         {
-            if (uid == player || !Exists(uid))
+            if (uid == player || !Exists(uid) || IsHiddenSubfloorEntity(uid))
                 continue;
 
             var pos = _transform.GetMapCoordinates(uid);
@@ -1123,14 +1232,17 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             if (!_solver.TryResolveGraphAndNode(uid, out _, out _, out _))
                 continue;
 
-            float distSq = (pos.Position - cursorMapCoords.Position).LengthSquared();
-            // Prefer unfinished frames slightly if right on the same tile
-            if (IsGhostOrUnfinishedFrame(uid))
-                distSq -= 0.01f;
+            float score = (pos.Position - cursorMapCoords.Position).LengthSquared();
 
-            if (distSq < bestScore)
+            // Prefer above-floor structures (consoles, machines, walls, doors, frames) over subfloor pipes/cables on the same tile
+            if (IsSubfloorEntity(uid))
+                score += 0.02f;
+            else if (IsGhostOrUnfinishedFrame(uid))
+                score -= 0.01f;
+
+            if (score < bestScore)
             {
-                bestScore = distSq;
+                bestScore = score;
                 bestEntity = uid;
             }
         }
@@ -1138,7 +1250,33 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         return bestEntity;
     }
 
+    private bool IsSubfloorEntity(EntityUid uid)
+    {
+        foreach (var comp in EntityManager.GetComponents(uid))
+        {
+            if (string.Equals(comp.GetType().Name, "SubFloorHideComponent", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private bool IsHiddenSubfloorEntity(EntityUid uid)
+    {
+        foreach (var comp in EntityManager.GetComponents(uid))
+        {
+            if (string.Equals(comp.GetType().Name, "SubFloorHideComponent", StringComparison.OrdinalIgnoreCase))
+            {
+                if (GetBoolMember(comp, "IsUnderCover"))
+                    return true;
+            }
+        }
+        return false;
+    }
+
     private bool TryRelocateTargetEntity(out EntityUid found)
+        => TryRelocateReplacementEntity(EntityUid.Invalid, out found);
+
+    private bool TryRelocateReplacementEntity(EntityUid excludeEntity, out EntityUid found)
     {
         found = EntityUid.Invalid;
         if (_targetMapCoords.MapId == MapId.Nullspace)
@@ -1149,7 +1287,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
         foreach (var uid in candidates)
         {
-            if (!Exists(uid) || Deleted(uid) || HasGhostComponent(uid))
+            if (uid == excludeEntity || !Exists(uid) || Deleted(uid) || HasGhostComponent(uid))
                 continue;
 
             if (!_solver.TryResolveGraphAndNode(uid, out var graph, out _, out _) || graph == null)
@@ -1298,13 +1436,13 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             return null;
 
         var type = obj.GetType();
-        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.IgnoreCase;
 
         var prop = type.GetProperty(name, flags);
         if (prop != null)
             return prop.GetValue(obj);
 
-        var field = type.GetField(name, flags);
+        var field = type.GetField(name, flags) ?? type.GetField("_" + name, flags);
         if (field != null)
             return field.GetValue(obj);
 

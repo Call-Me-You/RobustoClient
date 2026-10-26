@@ -101,6 +101,71 @@ public sealed class RobustaConstructionSolver : EntitySystem
         "apcFrame"
     };
 
+    private static readonly HashSet<string> KnownAnchorableFrameNodes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "girder",
+        "reinforcedGirder",
+        "assembly",
+        "frameUnsecured",
+        "missingWires",
+        "frame",
+        "machineFrame",
+        "computerFrame",
+        "apcFrame",
+        "wallFrame",
+        "windowFrame",
+        "pipe",
+        "binary",
+        "trinary",
+        "unary",
+        "disposal",
+        "disposal_pipe",
+        "trunk"
+    };
+
+    private static readonly string[] PipeAndAtmosKeywords =
+    {
+        "pipe",
+        "gaspipe",
+        "gasbinary",
+        "gastrinary",
+        "gasunary",
+        "disposal",
+        "manifold",
+        "valve",
+        "pump",
+        "mixer",
+        "filter",
+        "vent",
+        "scrubber",
+        "injector",
+        "trunk",
+        "router",
+        "junction",
+        "tagger",
+        "radiator",
+        "heatexchanger",
+        "connectorport",
+        "gasport"
+    };
+
+    private static readonly string[] BaseConsolePrototypeIds =
+    {
+        "BaseComputer",
+        "BaseStructureComputer",
+        "BaseComputerAiAccess",
+        "BaseComputerTabletop",
+        "BaseComputerShuttle",
+        "ComputerTabletop"
+    };
+
+    private static readonly string[] BaseMachinePrototypeIds =
+    {
+        "BaseMachine",
+        "ConstructibleMachine",
+        "BaseMachinePowered"
+    };
+
     public override void Initialize()
     {
         base.Initialize();
@@ -140,7 +205,7 @@ public sealed class RobustaConstructionSolver : EntitySystem
 
             var targetNodeName = GetStringMember(cProto, "TargetNode");
             if (!string.IsNullOrEmpty(targetNodeName) &&
-                _protoMan.TryIndex<ConstructionGraphPrototype>(graphId, out var cGraph) &&
+                TryGetGraph(graphId, out var cGraph) &&
                 TryGetNodeByName(cGraph, targetNodeName, out var targetNode))
             {
                 var targetEntId = GetNodeEntityId(targetNode, null);
@@ -159,37 +224,97 @@ public sealed class RobustaConstructionSolver : EntitySystem
             }
         }
 
-        // Map EntityPrototypes that either declare ConstructionComponent in YAML or are constructed from boards
+        TryFindComputerGraphAndNode(out var compGraph, out var compNode);
+        TryFindMachineGraphAndNode(out var machineGraph, out var machineNode);
+
+        // Register all intermediate ComputerFrame nodes so ComputerFrame can disambiguate its exact stage
+        if (compGraph != null)
+        {
+            string[] compFrameNodeNames =
+            {
+                "frameUnsecured",
+                "boardUnsecured",
+                "missingWires",
+                "monitorMissing",
+                "monitorUnsecured"
+            };
+            foreach (var cfNodeName in compFrameNodeNames)
+            {
+                if (TryGetNodeByName(compGraph, cfNodeName, out var cfNode))
+                    RegisterEntityNodeMapping("ComputerFrame", compGraph, cfNode);
+            }
+
+            if (compNode != null)
+            {
+                foreach (var baseConsoleId in BaseConsolePrototypeIds)
+                {
+                    RegisterEntityNodeMapping(baseConsoleId, compGraph, compNode);
+                }
+            }
+        }
+
+        // Register intermediate MachineFrame nodes and base machine prototypes
+        if (machineGraph != null)
+        {
+            string[] machineFrameNodeNames = { "missingWires", "machineFrame" };
+            foreach (var mfNodeName in machineFrameNodeNames)
+            {
+                if (TryGetNodeByName(machineGraph, mfNodeName, out var mfNode))
+                    RegisterEntityNodeMapping("MachineFrame", machineGraph, mfNode);
+            }
+
+            if (machineNode != null)
+            {
+                foreach (var baseMachineId in BaseMachinePrototypeIds)
+                {
+                    RegisterEntityNodeMapping(baseMachineId, machineGraph, machineNode);
+                }
+            }
+        }
+
+        // Map EntityPrototypes that declare ConstructionComponent, Computer/Machine components, or are constructed from boards
         foreach (var entityProto in _protoMan.EnumeratePrototypes<EntityPrototype>())
         {
             if (TryGetConstructionMappingFromPrototype(entityProto, out var graphId, out var nodeName) &&
-                _protoMan.TryIndex<ConstructionGraphPrototype>(graphId, out var graph) &&
+                TryGetGraph(graphId, out var graph) &&
                 TryGetNodeByName(graph, nodeName, out var node))
             {
                 RegisterEntityNodeMapping(entityProto.ID, graph, node);
             }
 
-            if (_itemUtil.TryGetPrototypeComponent<MachineBoardComponent>(entityProto, "MachineBoard", out var machineBoard) &&
-                machineBoard != null)
+            if (machineGraph != null && machineNode != null)
             {
-                var machineProtoId = GetStringMember(machineBoard, "Prototype");
-                if (!string.IsNullOrEmpty(machineProtoId) &&
-                    _protoMan.TryIndex<ConstructionGraphPrototype>("Machine", out var machineGraph) &&
-                    TryGetNodeByName(machineGraph, "machine", out var machineNode))
+                if (_itemUtil.TryGetPrototypeComponent<MachineBoardComponent>(entityProto, "MachineBoard", out var machineBoard) &&
+                    machineBoard != null)
                 {
-                    RegisterEntityNodeMapping(machineProtoId, machineGraph, machineNode);
+                    var machineProtoId = GetStringMember(machineBoard, "Prototype");
+                    if (!string.IsNullOrEmpty(machineProtoId))
+                        RegisterEntityNodeMapping(machineProtoId, machineGraph, machineNode);
+                }
+
+                if (!string.Equals(entityProto.ID, "MachineFrame", StringComparison.OrdinalIgnoreCase) &&
+                    _itemUtil.HasPrototypeComponent(entityProto, "Machine"))
+                {
+                    RegisterEntityNodeMapping(entityProto.ID, machineGraph, machineNode);
                 }
             }
 
-            if (_itemUtil.TryGetPrototypeComponent<ComputerBoardComponent>(entityProto, "ComputerBoard", out var compBoard) &&
-                compBoard != null)
+            if (compGraph != null && compNode != null)
             {
-                var compProtoId = GetStringMember(compBoard, "Prototype");
-                if (!string.IsNullOrEmpty(compProtoId) &&
-                    _protoMan.TryIndex<ConstructionGraphPrototype>("Computer", out var compGraph) &&
-                    TryGetNodeByName(compGraph, "computer", out var compNode))
+                if (_itemUtil.TryGetPrototypeComponent<ComputerBoardComponent>(entityProto, "ComputerBoard", out var compBoard) &&
+                    compBoard != null)
                 {
-                    RegisterEntityNodeMapping(compProtoId, compGraph, compNode);
+                    var compProtoId = GetStringMember(compBoard, "Prototype");
+                    if (!string.IsNullOrEmpty(compProtoId))
+                        RegisterEntityNodeMapping(compProtoId, compGraph, compNode);
+                }
+
+                if (!string.Equals(entityProto.ID, "ComputerFrame", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(entityProto.ID, "ComputerBroken", StringComparison.OrdinalIgnoreCase) &&
+                    (_itemUtil.HasPrototypeComponent(entityProto, "Computer") ||
+                     _itemUtil.HasPrototypeComponent(entityProto, "SharedComputer")))
+                {
+                    RegisterEntityNodeMapping(entityProto.ID, compGraph, compNode);
                 }
             }
 
@@ -214,6 +339,118 @@ public sealed class RobustaConstructionSolver : EntitySystem
                 }
             }
         }
+    }
+
+    private bool TryGetGraph(string graphId, out ConstructionGraphPrototype graph)
+    {
+        if (_protoMan.TryIndex(graphId, out graph!))
+            return true;
+
+        foreach (var g in _protoMan.EnumeratePrototypes<ConstructionGraphPrototype>())
+        {
+            if (string.Equals(g.ID, graphId, StringComparison.OrdinalIgnoreCase))
+            {
+                graph = g;
+                return true;
+            }
+        }
+
+        graph = default!;
+        return false;
+    }
+
+    private bool TryFindComputerGraphAndNode(
+        out ConstructionGraphPrototype? compGraph,
+        out ConstructionGraphNode? compNode)
+    {
+        compGraph = null;
+        compNode = null;
+
+        if (!TryGetGraph("Computer", out var g))
+        {
+            foreach (var candidate in _protoMan.EnumeratePrototypes<ConstructionGraphPrototype>())
+            {
+                foreach (var n in EnumerateGraphNodes(candidate))
+                {
+                    if (string.Equals(GetNodeEntityId(n, null), "ComputerFrame", StringComparison.OrdinalIgnoreCase))
+                    {
+                        g = candidate;
+                        break;
+                    }
+                }
+                if (g != null)
+                    break;
+            }
+        }
+
+        if (g == null)
+            return false;
+
+        compGraph = g;
+        if (TryGetNodeByName(g, "computer", out var namedNode))
+        {
+            compNode = namedNode;
+            return true;
+        }
+
+        foreach (var n in EnumerateGraphNodes(g))
+        {
+            var entObj = GetMemberValue(n, "Entity");
+            if (entObj != null && entObj.GetType().Name.Contains("BoardNodeEntity", StringComparison.OrdinalIgnoreCase))
+            {
+                compNode = n;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryFindMachineGraphAndNode(
+        out ConstructionGraphPrototype? machineGraph,
+        out ConstructionGraphNode? machineNode)
+    {
+        machineGraph = null;
+        machineNode = null;
+
+        if (!TryGetGraph("Machine", out var g))
+        {
+            foreach (var candidate in _protoMan.EnumeratePrototypes<ConstructionGraphPrototype>())
+            {
+                foreach (var n in EnumerateGraphNodes(candidate))
+                {
+                    if (string.Equals(GetNodeEntityId(n, null), "MachineFrame", StringComparison.OrdinalIgnoreCase))
+                    {
+                        g = candidate;
+                        break;
+                    }
+                }
+                if (g != null)
+                    break;
+            }
+        }
+
+        if (g == null)
+            return false;
+
+        machineGraph = g;
+        if (TryGetNodeByName(g, "machine", out var namedNode))
+        {
+            machineNode = namedNode;
+            return true;
+        }
+
+        foreach (var n in EnumerateGraphNodes(g))
+        {
+            var entObj = GetMemberValue(n, "Entity");
+            if (entObj != null && entObj.GetType().Name.Contains("BoardNodeEntity", StringComparison.OrdinalIgnoreCase))
+            {
+                machineNode = n;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void RegisterEntityNodeMapping(string entityProtoId, ConstructionGraphPrototype graph, ConstructionGraphNode node)
@@ -312,10 +549,12 @@ public sealed class RobustaConstructionSolver : EntitySystem
             return null;
 
         var steps = new List<ConstructionActionStep>();
-        foreach (var (fromNode, edge, toNode) in edgePath)
+        for (int i = 0; i < edgePath.Count; i++)
         {
+            var (fromNode, edge, toNode) = edgePath[i];
+            bool isFirstEdge = i == 0;
             AppendMachineFrameStepsIfNeeded(target, graph, fromNode, toNode, steps);
-            AppendAnchorTransitionStepIfNeeded(graph, fromNode, toNode, isDeconstruct: false, steps);
+            AppendAnchorTransitionStepIfNeeded(target, isFirstEdge, graph, fromNode, edge, toNode, isDeconstruct: false, steps);
             ConvertEdgeSteps(edge, GetNodeName(toNode), steps);
         }
 
@@ -340,7 +579,7 @@ public sealed class RobustaConstructionSolver : EntitySystem
 
         if (string.IsNullOrEmpty(graphId) ||
             string.IsNullOrEmpty(targetNodeName) ||
-            !_protoMan.TryIndex<ConstructionGraphPrototype>(graphId, out var graph))
+            !TryGetGraph(graphId, out var graph))
         {
             return null;
         }
@@ -369,10 +608,12 @@ public sealed class RobustaConstructionSolver : EntitySystem
                 ExpectedNextNode: firstNodeAfterGhost));
         }
 
-        foreach (var (fromNode, edge, toNode) in edgePath)
+        for (int i = 0; i < edgePath.Count; i++)
         {
+            var (fromNode, edge, toNode) = edgePath[i];
+            bool isFirstEdge = i == 0;
             AppendMachineFrameStepsIfNeeded(null, graph, fromNode, toNode, steps);
-            AppendAnchorTransitionStepIfNeeded(graph, fromNode, toNode, isDeconstruct: false, steps);
+            AppendAnchorTransitionStepIfNeeded(null, isFirstEdge, graph, fromNode, edge, toNode, isDeconstruct: false, steps);
             ConvertEdgeSteps(edge, GetNodeName(toNode), steps);
         }
 
@@ -412,8 +653,11 @@ public sealed class RobustaConstructionSolver : EntitySystem
                 continue;
 
             var steps = new List<ConstructionActionStep>();
+            var firstEdge = edgePath[0].Edge;
             var panelComp = FindComponentByName(target, "WiresPanelComponent");
-            if (panelComp != null && GetMemberValue(panelComp, "Open") is false)
+            if (panelComp != null &&
+                GetMemberValue(panelComp, "Open") is false &&
+                ShouldOpenWirePanelBeforeEdge(graph, currentNode, firstEdge, panelComp))
             {
                 var openTool = GetStringMember(panelComp, "OpeningTool") ?? "Screwing";
                 steps.Add(new ConstructionActionStep(
@@ -421,13 +665,15 @@ public sealed class RobustaConstructionSolver : EntitySystem
                     $"Open wire panel ({openTool})",
                     PrototypeOrQualityOrTag: openTool,
                     Amount: 1,
-                    DoAfterDelay: 1f,
-                    ExpectedNextNode: currentNodeName));
+                    DoAfterDelay: 0f,
+                    ExpectedNextNode: null));
             }
 
-            foreach (var (fromNode, edge, toNode) in edgePath)
+            for (int i = 0; i < edgePath.Count; i++)
             {
-                AppendAnchorTransitionStepIfNeeded(graph, fromNode, toNode, isDeconstruct: true, steps);
+                var (fromNode, edge, toNode) = edgePath[i];
+                bool isFirstEdge = i == 0;
+                AppendAnchorTransitionStepIfNeeded(target, isFirstEdge, graph, fromNode, edge, toNode, isDeconstruct: true, steps);
                 ConvertEdgeSteps(edge, GetNodeName(toNode), steps);
             }
 
@@ -440,6 +686,91 @@ public sealed class RobustaConstructionSolver : EntitySystem
                 targetNodeName,
                 IsDeconstruct: true,
                 Steps: steps);
+        }
+
+        return null;
+    }
+
+    private bool ShouldOpenWirePanelBeforeEdge(
+        ConstructionGraphPrototype graph,
+        ConstructionGraphNode currentNode,
+        ConstructionGraphEdge firstEdge,
+        IComponent panelComp)
+    {
+        if (TryGetEdgeWirePanelCondition(firstEdge, out bool requiredOpen))
+            return requiredOpen;
+
+        // Consoles (Computer graph) do not require opening a wire panel to deconstruct;
+        // their first deconstruction step operates directly on the monitor/frame.
+        if (string.Equals(graph.ID, "Computer", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(GetNodeName(currentNode), "computer", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var openTool = GetStringMember(panelComp, "OpeningTool") ?? "Screwing";
+        if (FirstEdgeStepIsTool(firstEdge, openTool))
+            return false;
+
+        return true;
+    }
+
+    public bool DoesEdgeReplaceOrDeleteEntity(EntityUid currentTarget, string graphId, string? expectedNextNode)
+    {
+        if (string.IsNullOrEmpty(expectedNextNode) || !_entMan.EntityExists(currentTarget))
+            return false;
+
+        EnsureCacheInitialized();
+
+        if (!TryGetGraph(graphId, out var graph) ||
+            !TryGetNodeByName(graph, expectedNextNode, out var toNode))
+        {
+            return string.Equals(expectedNextNode, "start", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(expectedNextNode, "girder", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (IsTerminalDeconstructNode(graph, toNode))
+            return true;
+
+        var currentProtoId = _entMan.GetComponent<MetaDataComponent>(currentTarget).EntityPrototype?.ID;
+
+        var entObj = GetMemberValue(toNode, "Entity") ?? GetMemberValue(toNode, "_entity");
+        if (entObj != null && entObj.GetType().Name.Contains("BoardNodeEntity", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var nextProtoId = GetNodeEntityId(toNode, currentTarget)
+                          ?? GetInferredFramePrototypeForNode(graph, toNode);
+
+        if (!string.IsNullOrEmpty(nextProtoId) &&
+            !string.IsNullOrEmpty(currentProtoId) &&
+            !string.Equals(currentProtoId, nextProtoId, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private string? GetInferredFramePrototypeForNode(ConstructionGraphPrototype graph, ConstructionGraphNode node)
+    {
+        var nodeName = GetNodeName(node);
+        if (string.Equals(graph.ID, "Computer", StringComparison.OrdinalIgnoreCase) &&
+            (string.Equals(nodeName, "frameUnsecured", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(nodeName, "boardUnsecured", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(nodeName, "missingWires", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(nodeName, "monitorMissing", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(nodeName, "monitorUnsecured", StringComparison.OrdinalIgnoreCase)))
+        {
+            return "ComputerFrame";
+        }
+
+        if (string.Equals(graph.ID, "Machine", StringComparison.OrdinalIgnoreCase) &&
+            (string.Equals(nodeName, "machineFrame", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(nodeName, "missingWires", StringComparison.OrdinalIgnoreCase)))
+        {
+            return "MachineFrame";
         }
 
         return null;
@@ -525,7 +856,7 @@ public sealed class RobustaConstructionSolver : EntitySystem
             explicitTargetNode = GetStringMember(constructionComp, "TargetNode");
 
             if (!string.IsNullOrEmpty(graphId) &&
-                _protoMan.TryIndex(graphId, out graph) &&
+                TryGetGraph(graphId, out graph) &&
                 !string.IsNullOrEmpty(nodeName) &&
                 TryGetNodeByName(graph, nodeName, out node))
             {
@@ -536,34 +867,57 @@ public sealed class RobustaConstructionSolver : EntitySystem
         // 2. Fallback to EntityPrototype ID -> (Graph, Node) lookup
         var meta = _entMan.GetComponent<MetaDataComponent>(target);
         var proto = meta.EntityPrototype;
-        if (proto == null)
-            return false;
-
-        // Walk the prototype and its parents
-        var visitedProtos = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var protoQueue = new Queue<EntityPrototype>();
-        protoQueue.Enqueue(proto);
-        visitedProtos.Add(proto.ID);
-
-        while (protoQueue.Count > 0)
+        if (proto != null)
         {
-            var curProto = protoQueue.Dequeue();
-            if (_entityToGraphNodes.TryGetValue(curProto.ID, out var candidates) && candidates.Count > 0)
-            {
-                var chosen = SelectBestNodeCandidate(target, candidates);
-                graph = chosen.Graph;
-                node = chosen.Node;
-                return true;
-            }
+            var visitedProtos = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var protoQueue = new Queue<EntityPrototype>();
+            protoQueue.Enqueue(proto);
+            visitedProtos.Add(proto.ID);
 
-            if (curProto.Parents != null)
+            while (protoQueue.Count > 0)
             {
-                foreach (var parentId in curProto.Parents)
+                var curProto = protoQueue.Dequeue();
+                if (_entityToGraphNodes.TryGetValue(curProto.ID, out var candidates) && candidates.Count > 0)
                 {
-                    if (visitedProtos.Add(parentId) && _protoMan.TryIndex<EntityPrototype>(parentId, out var parentProto))
-                        protoQueue.Enqueue(parentProto);
+                    var chosen = SelectBestNodeCandidate(target, candidates);
+                    graph = chosen.Graph;
+                    node = chosen.Node;
+                    return true;
+                }
+
+                if (curProto.Parents != null)
+                {
+                    foreach (var parentId in curProto.Parents)
+                    {
+                        if (visitedProtos.Add(parentId) && _protoMan.TryIndex<EntityPrototype>(parentId, out var parentProto))
+                            protoQueue.Enqueue(parentProto);
+                    }
                 }
             }
+        }
+
+        // 3. Live-component fallback for Consoles (ComputerComponent) and Machines (MachineComponent)
+        var protoIdStr = proto?.ID ?? string.Empty;
+        if (!string.Equals(protoIdStr, "ComputerFrame", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(protoIdStr, "ComputerBroken", StringComparison.OrdinalIgnoreCase) &&
+            (FindComponentByName(target, "ComputerComponent") != null ||
+             FindComponentByName(target, "SharedComputerComponent") != null) &&
+            TryFindComputerGraphAndNode(out var compGraph, out var compNode) &&
+            compGraph != null && compNode != null)
+        {
+            graph = compGraph;
+            node = compNode;
+            return true;
+        }
+
+        if (!string.Equals(protoIdStr, "MachineFrame", StringComparison.OrdinalIgnoreCase) &&
+            FindComponentByName(target, "MachineComponent") != null &&
+            TryFindMachineGraphAndNode(out var machineGraph, out var machineNode) &&
+            machineGraph != null && machineNode != null)
+        {
+            graph = machineGraph;
+            node = machineNode;
+            return true;
         }
 
         return false;
@@ -576,10 +930,68 @@ public sealed class RobustaConstructionSolver : EntitySystem
         if (candidates.Count == 1)
             return candidates[0];
 
-        // Disambiguate multi-node frames like ComputerFrame or AirlockAssembly using container state
         bool hasBoard = _container.TryGetContainer(target, "board", out var boardCont) && boardCont.ContainedEntities.Count > 0;
         if (!hasBoard && _container.TryGetContainer(target, "machine_board", out var mBoardCont) && mBoardCont.ContainedEntities.Count > 0)
             hasBoard = true;
+
+        TryGetSpriteLayerZeroState(target, out var spriteState);
+
+        // Disambiguate ComputerFrame stages ("0" -> frameUnsecured, "1" -> boardUnsecured, "2" -> missingWires, "3" -> monitorMissing, "4" -> monitorUnsecured)
+        if (candidates.Any(c => string.Equals(c.Graph.ID, "Computer", StringComparison.OrdinalIgnoreCase)))
+        {
+            string? desiredCompFrameNode = spriteState switch
+            {
+                "4" => "monitorUnsecured",
+                "3" => "monitorMissing",
+                "2" => "missingWires",
+                "1" => "boardUnsecured",
+                "0" => "frameUnsecured",
+                _ => null
+            };
+
+            if (desiredCompFrameNode != null)
+            {
+                foreach (var candidate in candidates)
+                {
+                    if (string.Equals(GetNodeName(candidate.Node), desiredCompFrameNode, StringComparison.OrdinalIgnoreCase))
+                        return candidate;
+                }
+            }
+
+            if (hasBoard)
+            {
+                foreach (var candidate in candidates)
+                {
+                    var name = GetNodeName(candidate.Node);
+                    if (name.Equals("monitorUnsecured", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("boardUnsecured", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+        }
+
+        // Disambiguate MachineFrame stages ("missingWires" vs "machineFrame")
+        if (candidates.Any(c => string.Equals(c.Graph.ID, "Machine", StringComparison.OrdinalIgnoreCase)))
+        {
+            if (hasBoard || (spriteState != null && !spriteState.EndsWith("_0", StringComparison.OrdinalIgnoreCase)))
+            {
+                foreach (var candidate in candidates)
+                {
+                    if (string.Equals(GetNodeName(candidate.Node), "machineFrame", StringComparison.OrdinalIgnoreCase))
+                        return candidate;
+                }
+            }
+            else if (spriteState != null && spriteState.EndsWith("_0", StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var candidate in candidates)
+                {
+                    if (string.Equals(GetNodeName(candidate.Node), "missingWires", StringComparison.OrdinalIgnoreCase))
+                        return candidate;
+                }
+            }
+        }
 
         if (!hasBoard)
         {
@@ -597,6 +1009,43 @@ public sealed class RobustaConstructionSolver : EntitySystem
         }
 
         return candidates[0];
+    }
+
+    private bool TryGetSpriteLayerZeroState(EntityUid uid, out string? stateName)
+    {
+        stateName = null;
+        var spriteComp = FindComponentByName(uid, "SpriteComponent");
+        if (spriteComp == null)
+            return false;
+
+        try
+        {
+            var layers = GetMemberValue(spriteComp, "AllLayers") as IEnumerable
+                         ?? GetMemberValue(spriteComp, "_layers") as IEnumerable;
+            if (layers != null)
+            {
+                foreach (var layer in layers)
+                {
+                    if (layer == null)
+                        continue;
+
+                    var stateObj = GetMemberValue(layer, "State");
+                    var name = GetStringMember(stateObj, "Name") ?? stateObj?.ToString();
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        stateName = name;
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+        catch
+        {
+            // Ignore reflection differences across forks
+        }
+
+        return false;
     }
 
     private string? FindBestBuildTargetNode(ConstructionGraphPrototype graph, ConstructionGraphNode currentNode)
@@ -795,24 +1244,59 @@ public sealed class RobustaConstructionSolver : EntitySystem
     }
 
     private void AppendAnchorTransitionStepIfNeeded(
+        EntityUid? target,
+        bool isFirstEdge,
         ConstructionGraphPrototype graph,
         ConstructionGraphNode fromNode,
+        ConstructionGraphEdge edge,
         ConstructionGraphNode toNode,
         bool isDeconstruct,
         List<ConstructionActionStep> steps)
     {
         var fromName = GetNodeName(fromNode);
-        var toName = GetNodeName(toNode);
 
+        // Avoid adding a duplicate anchoring step if the edge's own steps already use Anchoring
+        if (EdgeContainsToolStep(edge, "Anchoring"))
+            return;
+
+        if (steps.Count > 0 &&
+            steps[^1].Kind == ConstructionActionKind.UseTool &&
+            string.Equals(steps[^1].PrototypeOrQualityOrTag, "Anchoring", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        // 1. Check explicit EntityAnchored condition on the edge if present on the client
+        if (TryGetEdgeAnchoredCondition(edge, out bool requiredAnchored))
+        {
+            if (!requiredAnchored)
+            {
+                steps.Add(new ConstructionActionStep(
+                    ConstructionActionKind.UseTool,
+                    "Unanchor structure (Anchoring)",
+                    PrototypeOrQualityOrTag: "Anchoring",
+                    Amount: 1,
+                    DoAfterDelay: 1f,
+                    ExpectedNextNode: null));
+            }
+            else
+            {
+                steps.Add(new ConstructionActionStep(
+                    ConstructionActionKind.UseTool,
+                    "Anchor frame (Anchoring)",
+                    PrototypeOrQualityOrTag: "Anchoring",
+                    Amount: 1,
+                    DoAfterDelay: 1f,
+                    ExpectedNextNode: null));
+            }
+            return;
+        }
+
+        // 2. Fallback when edge conditions are serverOnly (stripped on client)
         if (isDeconstruct)
         {
-            // Unanchoring before final deconstruction to start node for structures that require anchored: false
-            if (string.Equals(toName, "start", StringComparison.OrdinalIgnoreCase) &&
-                (string.Equals(fromName, "girder", StringComparison.OrdinalIgnoreCase) ||
-                 string.Equals(fromName, "assembly", StringComparison.OrdinalIgnoreCase) ||
-                 string.Equals(fromName, "frameUnsecured", StringComparison.OrdinalIgnoreCase) ||
-                 string.Equals(fromName, "missingWires", StringComparison.OrdinalIgnoreCase) ||
-                 string.Equals(fromName, "frame", StringComparison.OrdinalIgnoreCase)))
+            if (IsTerminalDeconstructNode(graph, toNode) &&
+                NeedsUnanchorBeforeDeconstruct(target, isFirstEdge, graph, fromNode, edge))
             {
                 steps.Add(new ConstructionActionStep(
                     ConstructionActionKind.UseTool,
@@ -825,12 +1309,9 @@ public sealed class RobustaConstructionSolver : EntitySystem
         }
         else
         {
-            // Anchoring frames/assemblies that spawn unanchored (skipped automatically at runtime if already anchored)
-            if (string.Equals(fromName, "assembly", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(fromName, "missingWires", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(fromName, "frameUnsecured", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(fromName, "girder", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(fromName, "frame", StringComparison.OrdinalIgnoreCase))
+            // Anchoring frames/assemblies/pipes that spawn unanchored (skipped automatically at runtime if already anchored)
+            if (KnownAnchorableFrameNodes.Contains(fromName) ||
+                IsPipeOrAtmosGraphOrNode(graph, fromNode, target))
             {
                 steps.Add(new ConstructionActionStep(
                     ConstructionActionKind.UseTool,
@@ -841,6 +1322,185 @@ public sealed class RobustaConstructionSolver : EntitySystem
                     ExpectedNextNode: null));
             }
         }
+    }
+
+    private bool IsTerminalDeconstructNode(ConstructionGraphPrototype graph, ConstructionGraphNode toNode)
+    {
+        var toName = GetNodeName(toNode);
+        if (string.IsNullOrEmpty(toName))
+            return false;
+
+        if (string.Equals(toName, "start", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var graphStart = GetStringMember(graph, "Start");
+        if (!string.IsNullOrEmpty(graphStart) &&
+            string.Equals(toName, graphStart, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (PrimaryDeconstructTargets.Contains(toName, StringComparer.OrdinalIgnoreCase))
+            return true;
+
+        return string.IsNullOrEmpty(GetNodeEntityId(toNode, null)) &&
+               GetNodeEdges(toNode).Count == 0;
+    }
+
+    private bool NeedsUnanchorBeforeDeconstruct(
+        EntityUid? target,
+        bool isFirstEdge,
+        ConstructionGraphPrototype graph,
+        ConstructionGraphNode fromNode,
+        ConstructionGraphEdge edge)
+    {
+        var fromName = GetNodeName(fromNode);
+
+        if (KnownAnchorableFrameNodes.Contains(fromName))
+            return true;
+
+        if (IsPipeOrAtmosGraphOrNode(graph, fromNode, target))
+            return true;
+
+        // Grilles deconstruct directly via Cutting without unanchoring
+        if (string.Equals(graph.ID, "Grille", StringComparison.OrdinalIgnoreCase) ||
+            fromName.Contains("grille", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (HasAnchorableComponent(target, isFirstEdge, graph, fromNode) &&
+            (EdgeContainsToolStep(edge, "Welding") ||
+             EdgeContainsToolStep(edge, "Screwing") ||
+             EdgeContainsToolStep(edge, "Prying")))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool IsPipeOrAtmosGraphOrNode(
+        ConstructionGraphPrototype graph,
+        ConstructionGraphNode node,
+        EntityUid? target)
+    {
+        var graphId = graph.ID ?? string.Empty;
+        var nodeName = GetNodeName(node);
+        var nodeEntId = GetNodeEntityId(node, target) ?? string.Empty;
+        var targetProtoId = target.HasValue && _entMan.EntityExists(target.Value)
+            ? _entMan.GetComponent<MetaDataComponent>(target.Value).EntityPrototype?.ID ?? string.Empty
+            : string.Empty;
+
+        foreach (var kw in PipeAndAtmosKeywords)
+        {
+            if (graphId.Contains(kw, StringComparison.OrdinalIgnoreCase) ||
+                nodeName.Contains(kw, StringComparison.OrdinalIgnoreCase) ||
+                nodeEntId.Contains(kw, StringComparison.OrdinalIgnoreCase) ||
+                targetProtoId.Contains(kw, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool HasAnchorableComponent(
+        EntityUid? target,
+        bool isFirstEdge,
+        ConstructionGraphPrototype graph,
+        ConstructionGraphNode fromNode)
+    {
+        if (isFirstEdge && target.HasValue && _entMan.EntityExists(target.Value))
+        {
+            if (_entMan.HasComponent<AnchorableComponent>(target.Value) ||
+                FindComponentByName(target.Value, "AnchorableComponent") != null)
+            {
+                return true;
+            }
+        }
+
+        var protoId = GetNodeEntityId(fromNode, target)
+                      ?? GetInferredFramePrototypeForNode(graph, fromNode);
+        if (!string.IsNullOrEmpty(protoId) &&
+            _protoMan.TryIndex<EntityPrototype>(protoId, out var eProto))
+        {
+            if (_itemUtil.HasPrototypeComponent(eProto, "Anchorable"))
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool TryGetEdgeAnchoredCondition(ConstructionGraphEdge edge, out bool requiredAnchored)
+    {
+        requiredAnchored = false;
+        foreach (var cond in EnumerateEdgeConditions(edge))
+        {
+            if (cond.GetType().Name.Contains("EntityAnchored", StringComparison.OrdinalIgnoreCase))
+            {
+                if (GetMemberValue(cond, "Anchored") is bool b)
+                {
+                    requiredAnchored = b;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private bool TryGetEdgeWirePanelCondition(ConstructionGraphEdge edge, out bool requiredOpen)
+    {
+        requiredOpen = true;
+        foreach (var cond in EnumerateEdgeConditions(edge))
+        {
+            if (cond.GetType().Name.Contains("WirePanel", StringComparison.OrdinalIgnoreCase))
+            {
+                if (GetMemberValue(cond, "Open") is bool b)
+                    requiredOpen = b;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static IEnumerable<object> EnumerateEdgeConditions(ConstructionGraphEdge edge)
+    {
+        var conds = GetMemberValue(edge, "Conditions") as IEnumerable
+                    ?? GetMemberValue(edge, "_conditions") as IEnumerable;
+        if (conds == null)
+            yield break;
+
+        foreach (var c in conds)
+        {
+            if (c != null)
+                yield return c;
+        }
+    }
+
+    private bool FirstEdgeStepIsTool(ConstructionGraphEdge edge, string toolQuality)
+    {
+        var tmp = new List<ConstructionActionStep>();
+        ConvertEdgeSteps(edge, string.Empty, tmp);
+        return tmp.Count > 0 &&
+               tmp[0].Kind == ConstructionActionKind.UseTool &&
+               string.Equals(tmp[0].PrototypeOrQualityOrTag, toolQuality, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool EdgeContainsToolStep(ConstructionGraphEdge edge, string toolQuality)
+    {
+        var tmp = new List<ConstructionActionStep>();
+        ConvertEdgeSteps(edge, string.Empty, tmp);
+        foreach (var s in tmp)
+        {
+            if (s.Kind == ConstructionActionKind.UseTool &&
+                string.Equals(s.PrototypeOrQualityOrTag, toolQuality, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void AppendMachineFrameStepsIfNeeded(
@@ -1166,10 +1826,12 @@ public sealed class RobustaConstructionSolver : EntitySystem
                         args[i] = uid;
                     else if (pType == typeof(IEntityManager))
                         args[i] = _entMan;
+                    else if (pType == typeof(IPrototypeManager))
+                        args[i] = _protoMan;
                     else if (pType == typeof(IComponentFactory))
                         args[i] = _compFactory;
                     else if (pType.Name == "GraphNodeEntityArgs")
-                        args[i] = Activator.CreateInstance(pType, _entMan);
+                        args[i] = CreateGraphNodeEntityArgs(pType, uid);
                     else
                         args[i] = null;
                 }
@@ -1185,6 +1847,40 @@ public sealed class RobustaConstructionSolver : EntitySystem
         }
 
         return null;
+    }
+
+    private object? CreateGraphNodeEntityArgs(Type pType, EntityUid? uid)
+    {
+        foreach (var ctor in pType.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+        {
+            var cParams = ctor.GetParameters();
+            var cArgs = new object?[cParams.Length];
+            bool ok = true;
+            for (int i = 0; i < cParams.Length; i++)
+            {
+                var t = cParams[i].ParameterType;
+                if (t == typeof(EntityUid?) || t == typeof(EntityUid))
+                    cArgs[i] = uid ?? EntityUid.Invalid;
+                else if (t == typeof(IEntityManager))
+                    cArgs[i] = _entMan;
+                else if (t == typeof(IPrototypeManager))
+                    cArgs[i] = _protoMan;
+                else if (t == typeof(IComponentFactory))
+                    cArgs[i] = _compFactory;
+                else if (t.IsValueType)
+                    cArgs[i] = Activator.CreateInstance(t);
+                else
+                {
+                    ok = false;
+                    break;
+                }
+            }
+
+            if (ok)
+                return ctor.Invoke(cArgs);
+        }
+
+        return pType.IsValueType ? Activator.CreateInstance(pType) : null;
     }
 
     private IComponent? FindComponentByName(EntityUid uid, string componentTypeName)
@@ -1203,13 +1899,13 @@ public sealed class RobustaConstructionSolver : EntitySystem
             return null;
 
         var type = obj.GetType();
-        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.IgnoreCase;
 
         var prop = type.GetProperty(name, flags);
         if (prop != null)
             return prop.GetValue(obj);
 
-        var field = type.GetField(name, flags);
+        var field = type.GetField(name, flags) ?? type.GetField("_" + name, flags);
         if (field != null)
             return field.GetValue(obj);
 
