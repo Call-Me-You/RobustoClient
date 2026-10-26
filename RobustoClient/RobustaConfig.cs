@@ -9,23 +9,23 @@ namespace RobustoClient;
 public static class RobustaConfig
 {
     public static bool SpinBotEnabled;
-    
+
     public static float SpinBotDegreesPerSecond = 1440f;
-    
+
     public static bool AntiSlipEnabled = true;
-    
+
     public static bool MeleeAimbotEnabled = true;
 
     public static bool MeleeTriggerbotEnabled = false;
-    
+
     public static bool RangedAimbotEnabled = true;
-    
+
     public static float RangedAimbotRadius = 2f;
 
     public static bool SyndicateDetector = true;
-    
+
     public static bool FOVDisable = true;
-    
+
     public static bool OverlaysDisable = true;
 
     public static bool NoRecoilEnabled = false;
@@ -40,21 +40,21 @@ public static class RobustaConfig
     public static string ItemSearchQuery = "";
 
     // Radius (FOV) where aimbot searches for target (in meters/tiles from cursor)
-    public static float AimRadius = 5f; 
+    public static float AimRadius = 5f;
 
     // Maximum distance at which Target Lock continues to hold the target (so that lock resets if target goes off-screen)
     public static float MaxLockDistance = 15f;
 
     public static Keyboard.Key TargetLockKey = Keyboard.Key.Space;
 
-    public static Keyboard.Key AutoConstructKey = Keyboard.Key.V;
+    public static Keyboard.Key AutoConstructKey = Keyboard.Key.L;
 
-    public static Keyboard.Key AutoDeconstructKey = Keyboard.Key.N;
+    public static Keyboard.Key AutoDeconstructKey = Keyboard.Key.M;
 
     public static bool ThrowAimbotEnabled = true;
 
     public static float AimFovPixels { get; set; } = 100f; // Aimbot capture radius in pixels (Screen FOV)
-    
+
     // Average speed of a thrown item (needed for prediction)
     public static float DefaultThrowSpeed = 11f;
 
@@ -64,7 +64,7 @@ public static class RobustaConfig
     // Ping compensation
     public enum PingMode { Local, Stable, Laggy, Auto }
     public static PingMode CurrentPingMode = PingMode.Auto;
-    public static int ManualPingMs = 0; 
+    public static int ManualPingMs = 0;
 
     public static bool ContrabandDetector { get; set; } = true;
 
@@ -102,8 +102,9 @@ public static class RobustaConfig
         public bool UsePrediction { get; set; }
         public float AimRadius { get; set; } = 5f;
         public float MaxLockDistance { get; set; } = 15f;
-        public Keyboard.Key AutoConstructKey { get; set; } = Keyboard.Key.V;
-        public Keyboard.Key AutoDeconstructKey { get; set; } = Keyboard.Key.N;
+        public Keyboard.Key TargetLockKey { get; set; } = Keyboard.Key.Space;
+        public Keyboard.Key AutoConstructKey { get; set; } = Keyboard.Key.L;
+        public Keyboard.Key AutoDeconstructKey { get; set; } = Keyboard.Key.M;
         public bool ThrowAimbotEnabled { get; set; } = true;
         public float AimFovPixels { get; set; } = 100f;
         public float DefaultThrowSpeed { get; set; } = 11f;
@@ -140,6 +141,7 @@ public static class RobustaConfig
                 UsePrediction = UsePrediction,
                 AimRadius = AimRadius,
                 MaxLockDistance = MaxLockDistance,
+                TargetLockKey = TargetLockKey,
                 AutoConstructKey = AutoConstructKey,
                 AutoDeconstructKey = AutoDeconstructKey,
                 ThrowAimbotEnabled = ThrowAimbotEnabled,
@@ -187,6 +189,8 @@ public static class RobustaConfig
             UsePrediction = data.UsePrediction;
             AimRadius = data.AimRadius;
             MaxLockDistance = data.MaxLockDistance;
+            if (data.TargetLockKey != Keyboard.Key.Unknown)
+                TargetLockKey = data.TargetLockKey;
             if (data.AutoConstructKey != Keyboard.Key.Unknown)
                 AutoConstructKey = data.AutoConstructKey;
             if (data.AutoDeconstructKey != Keyboard.Key.Unknown)

@@ -15,6 +15,8 @@ using Content.Shared.Tools.Systems;
 using Robust.Client.Graphics;
 using Robust.Client.Input;
 using Robust.Client.Player;
+using Robust.Client.UserInterface;
+using Robust.Client.UserInterface.Controls;
 using Robust.Shared.GameObjects;
 using Robust.Shared.IoC;
 using Robust.Shared.Log;
@@ -31,6 +33,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 {
     [Dependency] private readonly IPlayerManager _player = default!;
     [Dependency] private readonly IInputManager _input = default!;
+    [Dependency] private readonly IUserInterfaceManager _uiMan = default!;
     [Dependency] private readonly IEyeManager _eye = default!;
     [Dependency] private readonly IPrototypeManager _protoMan = default!;
     [Dependency] private readonly EntityLookupSystem _lookup = default!;
@@ -355,10 +358,35 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     {
         base.FrameUpdate(frameTime);
 
-        if (!_input.IsKeyDown(RobustaConfig.AutoConstructKey))
+        // Only block hotkeys when actively typing inside an editable text control (e.g. chat or search box)
+        var focusedControl = _uiMan.KeyboardFocused;
+        bool isTyping = focusedControl is LineEdit or TextEdit;
+
+        if (!isTyping)
+        {
+            if (_input.IsKeyDown(RobustaConfig.AutoConstructKey))
+            {
+                HandleConstructKeyTap();
+            }
+            else
+            {
+                _wasConstructKeyDown = false;
+            }
+
+            if (_input.IsKeyDown(RobustaConfig.AutoDeconstructKey))
+            {
+                HandleDeconstructKeyTap();
+            }
+            else
+            {
+                _wasDeconstructKeyDown = false;
+            }
+        }
+        else
+        {
             _wasConstructKeyDown = false;
-        if (!_input.IsKeyDown(RobustaConfig.AutoDeconstructKey))
             _wasDeconstructKeyDown = false;
+        }
 
         if (_pendingSingleTap)
         {
@@ -685,247 +713,247 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         switch (_phase)
         {
             case StepExecutionPhase.PrepareAndEquip:
-            {
-                if (!PrepareAndEquipForStep(player, step))
                 {
-                    _log.Warning($"Failed to equip required item for step [{_stepIndex + 1}/{_activePlan.Steps.Count}]: {step.Description}");
-                    FinishCurrentPlan();
-                    return;
-                }
-
-                if (step.Kind == ConstructionActionKind.UseTool &&
-                    string.Equals(step.PrototypeOrQualityOrTag, "Welding", StringComparison.OrdinalIgnoreCase))
-                {
-                    _welderIgniteRetries = 0;
-                    _phase = StepExecutionPhase.EnsureWelderLit;
-                }
-                else
-                {
-                    _phase = StepExecutionPhase.PerformInteraction;
-                }
-                break;
-            }
-
-            case StepExecutionPhase.EnsureWelderLit:
-            {
-                var held = _hands.GetActiveItem(player);
-                if (held == null || !Exists(held.Value))
-                {
-                    _phase = StepExecutionPhase.PrepareAndEquip;
-                    return;
-                }
-
-                if (RequiresWelderIgnition(held.Value))
-                {
-                    if (IsWelderLit(held.Value))
+                    if (!PrepareAndEquipForStep(player, step))
                     {
-                        _litWelderUid = held.Value;
-                        _welderIgniteRetries = 0;
-                        _phase = StepExecutionPhase.PerformInteraction;
-                        break;
-                    }
-
-                    _welderIgniteRetries++;
-                    if (_welderIgniteRetries > 6)
-                    {
-                        _log.Warning($"Could not ignite welder {ToPrettyString(held.Value)} for step '{step.Description}'; stopping job.");
+                        _log.Warning($"Failed to equip required item for step [{_stepIndex + 1}/{_activePlan.Steps.Count}]: {step.Description}");
                         FinishCurrentPlan();
                         return;
                     }
 
-                    RaisePredictiveEvent(new RequestUseInHandEvent());
-                    _litWelderUid = held.Value;
-                    _waitTimer = 0.35f;
-                    return;
-                }
-
-                _phase = StepExecutionPhase.PerformInteraction;
-                break;
-            }
-
-            case StepExecutionPhase.PerformInteraction:
-            {
-                _sawDoAfterForStep = false;
-                _doAfterCancelledForStep = false;
-                _stepWaitElapsed = 0f;
-                _postDoAfterTimer = 0f;
-
-                if (step.Kind == ConstructionActionKind.StartGhostConstruction)
-                {
-                    if (HasGhostComponent(_currentTarget))
+                    if (step.Kind == ConstructionActionKind.UseTool &&
+                        string.Equals(step.PrototypeOrQualityOrTag, "Welding", StringComparison.OrdinalIgnoreCase))
                     {
-                        StartGhostConstruction(_currentTarget);
+                        _welderIgniteRetries = 0;
+                        _phase = StepExecutionPhase.EnsureWelderLit;
                     }
-                    _waitTimer = SettleDelay;
-                    _phase = StepExecutionPhase.WaitForCompletion;
-                    return;
+                    else
+                    {
+                        _phase = StepExecutionPhase.PerformInteraction;
+                    }
+                    break;
                 }
 
-                _stepStartTarget = _currentTarget;
-                _stepStartNode = _solver.TryResolveGraphAndNode(_currentTarget, out _, out var sNode, out _) && sNode != null
-                    ? sNode.Name
-                    : null;
-
-                _itemUtil.EnqueueClickEntity(_currentTarget);
-                _waitTimer = Math.Max(SettleDelay, step.DoAfterDelay > 0f ? 0.35f : 0.2f);
-                _phase = StepExecutionPhase.WaitForCompletion;
-                break;
-            }
-
-            case StepExecutionPhase.WaitForCompletion:
-            {
-                // If we started a ghost construction, wait until the ghost is replaced by the real entity
-                if (step.Kind == ConstructionActionKind.StartGhostConstruction)
+            case StepExecutionPhase.EnsureWelderLit:
                 {
-                    if (TryRelocateNonGhostTarget(out var spawnedStructure))
+                    var held = _hands.GetActiveItem(player);
+                    if (held == null || !Exists(held.Value))
                     {
-                        _currentTarget = spawnedStructure;
-                        _targetCoordinates = Transform(spawnedStructure).Coordinates;
-                        _targetMapCoords = _transform.GetMapCoordinates(spawnedStructure);
-                        _rescanTimer = 0f;
-                        _stepRetryCount = 0;
-                        _stepIndex++;
-                        AdvancePastAlreadyReachedNodes();
                         _phase = StepExecutionPhase.PrepareAndEquip;
                         return;
                     }
 
-                    _rescanTimer += frameTime;
-                    if (_rescanTimer >= TargetRescanTimeout)
+                    if (RequiresWelderIgnition(held.Value))
                     {
-                        _log.Warning("Timed out waiting for construction ghost to spawn structure.");
-                        FinishCurrentPlan();
-                    }
-                    return;
-                }
-
-                // For steps with a DoAfter delay (e.g. Welding, Wrenching, Prying, Screwing), ensure the DoAfter
-                // actually started and finished on the server before swapping tools or advancing to the next step.
-                if (step.DoAfterDelay > 0f)
-                {
-                    _stepWaitElapsed += frameTime;
-
-                    if (_doAfterCancelledForStep)
-                    {
-                        _log.Warning($"DoAfter cancelled during step '{step.Description}'; stopping job.");
-                        FinishCurrentPlan(cancelled: true);
-                        return;
-                    }
-
-                    if (!_sawDoAfterForStep)
-                    {
-                        bool nodeAlreadyChanged = false;
-                        if (Exists(_currentTarget) &&
-                            _solver.TryResolveGraphAndNode(_currentTarget, out _, out var checkNode, out _) &&
-                            checkNode != null &&
-                            !string.IsNullOrEmpty(step.ExpectedNextNode) &&
-                            !string.Equals(step.ExpectedNextNode, _stepStartNode, StringComparison.OrdinalIgnoreCase) &&
-                            string.Equals(checkNode.Name, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase))
+                        if (IsWelderLit(held.Value))
                         {
-                            nodeAlreadyChanged = true;
+                            _litWelderUid = held.Value;
+                            _welderIgniteRetries = 0;
+                            _phase = StepExecutionPhase.PerformInteraction;
+                            break;
                         }
 
-                        if (!nodeAlreadyChanged && _stepWaitElapsed < Math.Min(0.85f, step.DoAfterDelay + 0.4f))
+                        _welderIgniteRetries++;
+                        if (_welderIgniteRetries > 6)
                         {
-                            return;
-                        }
-
-                        if (!nodeAlreadyChanged && step.DoAfterDelay >= 0.45f)
-                        {
-                            _stepRetryCount++;
-                            if (_stepRetryCount <= 3)
-                            {
-                                _rescanTimer = 0f;
-                                _phase = StepExecutionPhase.PrepareAndEquip;
-                                return;
-                            }
-
-                            _log.Warning($"Step '{step.Description}' never started its DoAfter ({step.DoAfterDelay:0.0}s) after retries; stopping job.");
+                            _log.Warning($"Could not ignite welder {ToPrettyString(held.Value)} for step '{step.Description}'; stopping job.");
                             FinishCurrentPlan();
                             return;
                         }
-                    }
-                    else
-                    {
-                        // Give server-side DoAfter completion and node/entity transition a brief settle buffer
-                        // after the client DoAfter finishes so tool swapping never cancels the server's final tick.
-                        _postDoAfterTimer += frameTime;
-                        if (_postDoAfterTimer < 0.25f)
-                            return;
-                    }
-                }
 
-                // Verify Unanchor / Anchor transitions actually took effect before advancing
-                if (step.Kind == ConstructionActionKind.UseTool &&
-                    string.Equals(step.PrototypeOrQualityOrTag, "Anchoring", StringComparison.OrdinalIgnoreCase) &&
-                    Exists(_currentTarget))
-                {
-                    bool isAnchored = Transform(_currentTarget).Anchored;
-                    bool wantsUnanchor = step.Description.StartsWith("Unanchor", StringComparison.OrdinalIgnoreCase);
-                    bool wantsAnchor = step.Description.StartsWith("Anchor frame", StringComparison.OrdinalIgnoreCase);
-
-                    if ((wantsUnanchor && isAnchored) || (wantsAnchor && !isAnchored))
-                    {
-                        _rescanTimer += frameTime;
-                        if (_rescanTimer >= 0.7f)
-                        {
-                            _rescanTimer = 0f;
-                            _stepRetryCount++;
-                            if (_stepRetryCount <= 3)
-                            {
-                                _phase = StepExecutionPhase.PrepareAndEquip;
-                                return;
-                            }
-
-                            _log.Warning($"Step '{step.Description}' did not change anchored state after retries; stopping job.");
-                            FinishCurrentPlan();
-                        }
+                        RaisePredictiveEvent(new RequestUseInHandEvent());
+                        _litWelderUid = held.Value;
+                        _waitTimer = 0.35f;
                         return;
                     }
+
+                    _phase = StepExecutionPhase.PerformInteraction;
+                    break;
                 }
 
-                // If this step is the final step of an edge that replaces/deletes the entity (e.g. target node, start, or girder), wait for replacement
-                bool expectsEntityReplacement =
-                    !string.IsNullOrEmpty(step.ExpectedNextNode) &&
-                    !string.Equals(step.ExpectedNextNode, _stepStartNode, StringComparison.OrdinalIgnoreCase) &&
-                    (_stepIndex + 1 >= _activePlan.Steps.Count ||
-                     !string.Equals(_activePlan.Steps[_stepIndex + 1].ExpectedNextNode, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase)) &&
-                    (string.Equals(step.ExpectedNextNode, _activePlan.TargetNode, StringComparison.OrdinalIgnoreCase) ||
-                     string.Equals(step.ExpectedNextNode, "start", StringComparison.OrdinalIgnoreCase) ||
-                     string.Equals(step.ExpectedNextNode, "girder", StringComparison.OrdinalIgnoreCase));
-
-                if (expectsEntityReplacement && Exists(_currentTarget) && _currentTarget == _stepStartTarget)
+            case StepExecutionPhase.PerformInteraction:
                 {
-                    var curNodeName = _solver.TryResolveGraphAndNode(_currentTarget, out _, out var cNode, out _) && cNode != null
-                        ? cNode.Name
+                    _sawDoAfterForStep = false;
+                    _doAfterCancelledForStep = false;
+                    _stepWaitElapsed = 0f;
+                    _postDoAfterTimer = 0f;
+
+                    if (step.Kind == ConstructionActionKind.StartGhostConstruction)
+                    {
+                        if (HasGhostComponent(_currentTarget))
+                        {
+                            StartGhostConstruction(_currentTarget);
+                        }
+                        _waitTimer = SettleDelay;
+                        _phase = StepExecutionPhase.WaitForCompletion;
+                        return;
+                    }
+
+                    _stepStartTarget = _currentTarget;
+                    _stepStartNode = _solver.TryResolveGraphAndNode(_currentTarget, out _, out var sNode, out _) && sNode != null
+                        ? sNode.Name
                         : null;
 
-                    if (!string.Equals(curNodeName, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase))
-                    {
-                        _rescanTimer += frameTime;
-                        if (_rescanTimer >= 0.85f)
-                        {
-                            _rescanTimer = 0f;
-                            _stepRetryCount++;
-                            if (_stepRetryCount <= 3)
-                            {
-                                _phase = StepExecutionPhase.PrepareAndEquip;
-                                return;
-                            }
+                    _itemUtil.EnqueueClickEntity(_currentTarget);
+                    _waitTimer = Math.Max(SettleDelay, step.DoAfterDelay > 0f ? 0.35f : 0.2f);
+                    _phase = StepExecutionPhase.WaitForCompletion;
+                    break;
+                }
 
-                            _log.Warning($"Step '{step.Description}' did not transition to node '{step.ExpectedNextNode}' after retries; stopping job.");
+            case StepExecutionPhase.WaitForCompletion:
+                {
+                    // If we started a ghost construction, wait until the ghost is replaced by the real entity
+                    if (step.Kind == ConstructionActionKind.StartGhostConstruction)
+                    {
+                        if (TryRelocateNonGhostTarget(out var spawnedStructure))
+                        {
+                            _currentTarget = spawnedStructure;
+                            _targetCoordinates = Transform(spawnedStructure).Coordinates;
+                            _targetMapCoords = _transform.GetMapCoordinates(spawnedStructure);
+                            _rescanTimer = 0f;
+                            _stepRetryCount = 0;
+                            _stepIndex++;
+                            AdvancePastAlreadyReachedNodes();
+                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            return;
+                        }
+
+                        _rescanTimer += frameTime;
+                        if (_rescanTimer >= TargetRescanTimeout)
+                        {
+                            _log.Warning("Timed out waiting for construction ghost to spawn structure.");
                             FinishCurrentPlan();
                         }
                         return;
                     }
-                }
 
-                _stepIndex++;
-                _rescanTimer = 0f;
-                _stepRetryCount = 0;
-                _phase = StepExecutionPhase.PrepareAndEquip;
-                break;
-            }
+                    // For steps with a DoAfter delay (e.g. Welding, Wrenching, Prying, Screwing), ensure the DoAfter
+                    // actually started and finished on the server before swapping tools or advancing to the next step.
+                    if (step.DoAfterDelay > 0f)
+                    {
+                        _stepWaitElapsed += frameTime;
+
+                        if (_doAfterCancelledForStep)
+                        {
+                            _log.Warning($"DoAfter cancelled during step '{step.Description}'; stopping job.");
+                            FinishCurrentPlan(cancelled: true);
+                            return;
+                        }
+
+                        if (!_sawDoAfterForStep)
+                        {
+                            bool nodeAlreadyChanged = false;
+                            if (Exists(_currentTarget) &&
+                                _solver.TryResolveGraphAndNode(_currentTarget, out _, out var checkNode, out _) &&
+                                checkNode != null &&
+                                !string.IsNullOrEmpty(step.ExpectedNextNode) &&
+                                !string.Equals(step.ExpectedNextNode, _stepStartNode, StringComparison.OrdinalIgnoreCase) &&
+                                string.Equals(checkNode.Name, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase))
+                            {
+                                nodeAlreadyChanged = true;
+                            }
+
+                            if (!nodeAlreadyChanged && _stepWaitElapsed < Math.Min(0.85f, step.DoAfterDelay + 0.4f))
+                            {
+                                return;
+                            }
+
+                            if (!nodeAlreadyChanged && step.DoAfterDelay >= 0.45f)
+                            {
+                                _stepRetryCount++;
+                                if (_stepRetryCount <= 3)
+                                {
+                                    _rescanTimer = 0f;
+                                    _phase = StepExecutionPhase.PrepareAndEquip;
+                                    return;
+                                }
+
+                                _log.Warning($"Step '{step.Description}' never started its DoAfter ({step.DoAfterDelay:0.0}s) after retries; stopping job.");
+                                FinishCurrentPlan();
+                                return;
+                            }
+                        }
+                        else
+                        {
+                            // Give server-side DoAfter completion and node/entity transition a brief settle buffer
+                            // after the client DoAfter finishes so tool swapping never cancels the server's final tick.
+                            _postDoAfterTimer += frameTime;
+                            if (_postDoAfterTimer < 0.25f)
+                                return;
+                        }
+                    }
+
+                    // Verify Unanchor / Anchor transitions actually took effect before advancing
+                    if (step.Kind == ConstructionActionKind.UseTool &&
+                        string.Equals(step.PrototypeOrQualityOrTag, "Anchoring", StringComparison.OrdinalIgnoreCase) &&
+                        Exists(_currentTarget))
+                    {
+                        bool isAnchored = Transform(_currentTarget).Anchored;
+                        bool wantsUnanchor = step.Description.StartsWith("Unanchor", StringComparison.OrdinalIgnoreCase);
+                        bool wantsAnchor = step.Description.StartsWith("Anchor frame", StringComparison.OrdinalIgnoreCase);
+
+                        if ((wantsUnanchor && isAnchored) || (wantsAnchor && !isAnchored))
+                        {
+                            _rescanTimer += frameTime;
+                            if (_rescanTimer >= 0.7f)
+                            {
+                                _rescanTimer = 0f;
+                                _stepRetryCount++;
+                                if (_stepRetryCount <= 3)
+                                {
+                                    _phase = StepExecutionPhase.PrepareAndEquip;
+                                    return;
+                                }
+
+                                _log.Warning($"Step '{step.Description}' did not change anchored state after retries; stopping job.");
+                                FinishCurrentPlan();
+                            }
+                            return;
+                        }
+                    }
+
+                    // If this step is the final step of an edge that replaces/deletes the entity (e.g. target node, start, or girder), wait for replacement
+                    bool expectsEntityReplacement =
+                        !string.IsNullOrEmpty(step.ExpectedNextNode) &&
+                        !string.Equals(step.ExpectedNextNode, _stepStartNode, StringComparison.OrdinalIgnoreCase) &&
+                        (_stepIndex + 1 >= _activePlan.Steps.Count ||
+                         !string.Equals(_activePlan.Steps[_stepIndex + 1].ExpectedNextNode, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase)) &&
+                        (string.Equals(step.ExpectedNextNode, _activePlan.TargetNode, StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(step.ExpectedNextNode, "start", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(step.ExpectedNextNode, "girder", StringComparison.OrdinalIgnoreCase));
+
+                    if (expectsEntityReplacement && Exists(_currentTarget) && _currentTarget == _stepStartTarget)
+                    {
+                        var curNodeName = _solver.TryResolveGraphAndNode(_currentTarget, out _, out var cNode, out _) && cNode != null
+                            ? cNode.Name
+                            : null;
+
+                        if (!string.Equals(curNodeName, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _rescanTimer += frameTime;
+                            if (_rescanTimer >= 0.85f)
+                            {
+                                _rescanTimer = 0f;
+                                _stepRetryCount++;
+                                if (_stepRetryCount <= 3)
+                                {
+                                    _phase = StepExecutionPhase.PrepareAndEquip;
+                                    return;
+                                }
+
+                                _log.Warning($"Step '{step.Description}' did not transition to node '{step.ExpectedNextNode}' after retries; stopping job.");
+                                FinishCurrentPlan();
+                            }
+                            return;
+                        }
+                    }
+
+                    _stepIndex++;
+                    _rescanTimer = 0f;
+                    _stepRetryCount = 0;
+                    _phase = StepExecutionPhase.PrepareAndEquip;
+                    break;
+                }
         }
     }
 
@@ -964,79 +992,79 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         switch (step.Kind)
         {
             case ConstructionActionKind.StartGhostConstruction:
-            {
-                // Equip the first required material/item from the next step so the server accepts TryStartStructureConstructionMessage
-                if (_activePlan != null && _stepIndex + 1 < _activePlan.Steps.Count)
                 {
-                    var firstStep = _activePlan.Steps[_stepIndex + 1];
-                    if (firstStep.Kind != ConstructionActionKind.StartGhostConstruction)
-                        return PrepareAndEquipForStep(player, firstStep);
+                    // Equip the first required material/item from the next step so the server accepts TryStartStructureConstructionMessage
+                    if (_activePlan != null && _stepIndex + 1 < _activePlan.Steps.Count)
+                    {
+                        var firstStep = _activePlan.Steps[_stepIndex + 1];
+                        if (firstStep.Kind != ConstructionActionKind.StartGhostConstruction)
+                            return PrepareAndEquipForStep(player, firstStep);
+                    }
+                    return true;
                 }
-                return true;
-            }
 
             case ConstructionActionKind.AddMaterial:
-            {
-                var matId = step.PrototypeOrQualityOrTag;
-                if (string.IsNullOrEmpty(matId))
-                    return false;
+                {
+                    var matId = step.PrototypeOrQualityOrTag;
+                    if (string.IsNullOrEmpty(matId))
+                        return false;
 
-                // Try equipping by StackTypeId or prototype ID
-                if (_itemUtil.TryEquipItem(new ProtoId<StackPrototype>(matId), step.Amount))
-                    return true;
+                    // Try equipping by StackTypeId or prototype ID
+                    if (_itemUtil.TryEquipItem(new ProtoId<StackPrototype>(matId), step.Amount))
+                        return true;
 
-                return _itemUtil.TryEquipByPredicate(
-                    uid => TryComp<StackComponent>(uid, out var stack) &&
-                           string.Equals(stack.StackTypeId, matId, StringComparison.OrdinalIgnoreCase),
-                    $"Material:{matId}",
-                    step.Amount);
-            }
+                    return _itemUtil.TryEquipByPredicate(
+                        uid => TryComp<StackComponent>(uid, out var stack) &&
+                               string.Equals(stack.StackTypeId, matId, StringComparison.OrdinalIgnoreCase),
+                        $"Material:{matId}",
+                        step.Amount);
+                }
 
             case ConstructionActionKind.UseTool:
-            {
-                var quality = step.PrototypeOrQualityOrTag;
-                if (string.IsNullOrEmpty(quality))
-                    return false;
+                {
+                    var quality = step.PrototypeOrQualityOrTag;
+                    if (string.IsNullOrEmpty(quality))
+                        return false;
 
-                return _itemUtil.TryEquipByPredicate(
-                    uid => _toolSystem.HasQuality(uid, quality),
-                    $"Tool:{quality}");
-            }
+                    return _itemUtil.TryEquipByPredicate(
+                        uid => _toolSystem.HasQuality(uid, quality),
+                        $"Tool:{quality}");
+                }
 
             case ConstructionActionKind.InsertPrototype:
-            {
-                var protoId = step.PrototypeOrQualityOrTag;
-                if (string.IsNullOrEmpty(protoId))
-                    return false;
+                {
+                    var protoId = step.PrototypeOrQualityOrTag;
+                    if (string.IsNullOrEmpty(protoId))
+                        return false;
 
-                return _itemUtil.TryEquipItem(new EntProtoId(protoId), step.Amount);
-            }
+                    return _itemUtil.TryEquipItem(new EntProtoId(protoId), step.Amount);
+                }
 
             case ConstructionActionKind.InsertComponent:
-            {
-                var compName = step.PrototypeOrQualityOrTag;
-                if (string.IsNullOrEmpty(compName))
-                    return false;
+                {
+                    var compName = step.PrototypeOrQualityOrTag;
+                    if (string.IsNullOrEmpty(compName))
+                        return false;
 
-                return _itemUtil.TryEquipByPredicate(
-                    uid => EntityManager.GetComponents(uid).Any(c =>
-                        c.GetType().Name.Equals(compName, StringComparison.OrdinalIgnoreCase) ||
-                        c.GetType().Name.Equals(compName + "Component", StringComparison.OrdinalIgnoreCase)),
-                    $"Component:{compName}",
-                    step.Amount);
-            }
+                    return _itemUtil.TryEquipByPredicate(
+                        uid => EntityManager.GetComponents(uid).Any(c =>
+                            c.GetType().Name.Equals(compName, StringComparison.OrdinalIgnoreCase) ||
+                            c.GetType().Name.Equals(compName + "Component", StringComparison.OrdinalIgnoreCase)),
+                        $"Component:{compName}",
+                        step.Amount);
+                }
 
             case ConstructionActionKind.InsertTag:
-            {
-                var tag = step.PrototypeOrQualityOrTag;
-                if (string.IsNullOrEmpty(tag))
-                    return false;
+                {
+                    var tag = step.PrototypeOrQualityOrTag;
+                    if (string.IsNullOrEmpty(tag))
+                        return false;
 
-                return _itemUtil.TryEquipByPredicate(
-                    uid => _tagSystem.HasTag(uid, tag),
-                    $"Tag:{tag}",
-                    step.Amount);
-            }
+                    return _itemUtil.TryEquipByPredicate(
+                        uid => _tagSystem.HasTag(uid, tag),
+                        $"Tag:{tag}",
+                        step.Amount);
+                }
 
             default:
                 return false;
