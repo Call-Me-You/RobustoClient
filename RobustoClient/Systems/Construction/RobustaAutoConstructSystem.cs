@@ -12,6 +12,7 @@ using Content.Shared.Hands.EntitySystems;
 using Content.Shared.Stacks;
 using Content.Shared.Tag;
 using Content.Shared.Tools.Systems;
+using Content.Shared.Wires;
 using Robust.Client.Graphics;
 using Robust.Client.Input;
 using Robust.Client.Player;
@@ -42,6 +43,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     [Dependency] private readonly ItemUtilitySystem _itemUtil = default!;
     [Dependency] private readonly RobustaConstructionSolver _solver = default!;
     [Dependency] private readonly ConstructionSystem _clientConstruction = default!;
+    [Dependency] private readonly SharedUserInterfaceSystem _bui = default!;
 
     private ISawmill _log = default!;
 
@@ -81,6 +83,12 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     private bool _doAfterCancelledForStep;
     private float _stepWaitElapsed;
     private float _postDoAfterTimer;
+    private bool _buiOpenRequestedForStep;
+    private int? _lastCutWireId;
+    private int? _deferredBoltWireId;
+    private bool _pulsedDeferredBoltWire;
+    private float _wireCutPendingTimer;
+    private int _wireCutRetries;
 
     private readonly List<(EntityUid GridUid, Vector2i Tile, Direction Dir, BlueprintItemEntry Item)> _blueprintQueue = new();
     public IReadOnlyList<(EntityUid GridUid, Vector2i Tile, Direction Dir, BlueprintItemEntry Item)> PendingBlueprintTasks => _blueprintQueue;
@@ -239,6 +247,10 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         _doAfterCancelledForStep = false;
         _stepWaitElapsed = 0f;
         _postDoAfterTimer = 0f;
+        _buiOpenRequestedForStep = false;
+        _lastCutWireId = null;
+        _deferredBoltWireId = null;
+        _pulsedDeferredBoltWire = false;
 
         _log.Info($"Started {(plan.IsDeconstruct ? "Deconstruct" : "Build")} plan on {ToPrettyString(target)} " +
                   $"({plan.GraphId}: {plan.StartNode} -> {plan.TargetNode}, {plan.Steps.Count} steps).");
@@ -282,6 +294,10 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         _doAfterCancelledForStep = false;
         _stepWaitElapsed = 0f;
         _postDoAfterTimer = 0f;
+        _buiOpenRequestedForStep = false;
+        _lastCutWireId = null;
+        _deferredBoltWireId = null;
+        _pulsedDeferredBoltWire = false;
     }
 
     public void EnqueuePhasedBlueprintBuild(
@@ -668,6 +684,17 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
         var step = _activePlan.Steps[_stepIndex];
 
+        // Skip redundant door-weld step if door is already welded shut
+        if (step.Kind == ConstructionActionKind.UseTool &&
+            step.Description.StartsWith("Weld door shut", StringComparison.OrdinalIgnoreCase) &&
+            Exists(_currentTarget) &&
+            IsDoorWelded(_currentTarget))
+        {
+            _stepIndex++;
+            _phase = StepExecutionPhase.PrepareAndEquip;
+            return;
+        }
+
         // Skip redundant wire-panel open step if panel is already open
         if (step.Kind == ConstructionActionKind.UseTool &&
             step.Description.StartsWith("Open wire panel", StringComparison.OrdinalIgnoreCase) &&
@@ -676,6 +703,17 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         {
             _stepIndex++;
             _phase = StepExecutionPhase.PrepareAndEquip;
+            return;
+        }
+
+        // Handle BUI wire-cutting step (or a Cutting tool step on an entity whose open wire panel still has uncut BUI wires)
+        if (step.Kind == ConstructionActionKind.CutWires ||
+            (step.Kind == ConstructionActionKind.UseTool &&
+             string.Equals(step.PrototypeOrQualityOrTag, "Cutting", StringComparison.OrdinalIgnoreCase) &&
+             Exists(_currentTarget) &&
+             HasOpenWiresPanelWithUncutBuiWires(_currentTarget)))
+        {
+            ExecuteCutWiresStep(player, frameTime, step);
             return;
         }
 
@@ -783,6 +821,18 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     ? sNode.Name
                     : null;
 
+                if (step.Kind == ConstructionActionKind.UseTool &&
+                    step.Description.StartsWith("Weld door shut", StringComparison.OrdinalIgnoreCase) &&
+                    Exists(_currentTarget) &&
+                    IsDoorOpen(_currentTarget))
+                {
+                    // Close the open door first; WaitForCompletion will re-trigger welding once closed
+                    _itemUtil.EnqueueClickEntity(_currentTarget);
+                    _waitTimer = 0.6f;
+                    _phase = StepExecutionPhase.WaitForCompletion;
+                    return;
+                }
+
                 _itemUtil.EnqueueClickEntity(_currentTarget);
                 _waitTimer = Math.Max(SettleDelay, step.DoAfterDelay > 0f ? 0.35f : 0.2f);
                 _phase = StepExecutionPhase.WaitForCompletion;
@@ -855,6 +905,14 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         }
 
                         if (!stepAlreadyProgressed &&
+                            step.Description.StartsWith("Weld door shut", StringComparison.OrdinalIgnoreCase) &&
+                            Exists(_currentTarget) &&
+                            IsDoorWelded(_currentTarget))
+                        {
+                            stepAlreadyProgressed = true;
+                        }
+
+                        if (!stepAlreadyProgressed &&
                             Exists(_currentTarget) &&
                             _solver.TryResolveGraphAndNode(_currentTarget, out _, out var checkNode, out _) &&
                             checkNode != null &&
@@ -893,6 +951,29 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         if (_postDoAfterTimer < 0.25f)
                             return;
                     }
+                }
+
+                // Verify DoorWelded transitions actually took effect before advancing
+                if (step.Kind == ConstructionActionKind.UseTool &&
+                    step.Description.StartsWith("Weld door shut", StringComparison.OrdinalIgnoreCase) &&
+                    Exists(_currentTarget) &&
+                    !IsDoorWelded(_currentTarget))
+                {
+                    _rescanTimer += frameTime;
+                    if (_rescanTimer >= 0.7f)
+                    {
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        if (_stepRetryCount <= 3)
+                        {
+                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            return;
+                        }
+
+                        _log.Warning($"Step '{step.Description}' did not weld door shut after retries; stopping job.");
+                        FinishCurrentPlan();
+                    }
+                    return;
                 }
 
                 // Verify WirePanel open transitions actually took effect before advancing
@@ -1031,19 +1112,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             return;
         }
 
-        // In SS14, an entity replacement occurs when an edge finishes and arrives at curStep.ExpectedNextNode.
-        // Advance past the current step (and any remaining steps belonging to that same completed edge),
-        // without guessing future nodes on multi-node frames like ComputerFrame.
-        var completedEdgeTarget = curStep.ExpectedNextNode;
+        // Advance past the current step that triggered the entity replacement.
         _stepIndex++;
-        if (!string.IsNullOrEmpty(completedEdgeTarget))
-        {
-            while (_stepIndex < _activePlan.Steps.Count &&
-                   string.Equals(_activePlan.Steps[_stepIndex].ExpectedNextNode, completedEdgeTarget, StringComparison.OrdinalIgnoreCase))
-            {
-                _stepIndex++;
-            }
-        }
     }
 
     private bool IsWirePanelOpen(EntityUid uid)
@@ -1054,6 +1124,335 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 return GetBoolMember(comp, "Open");
         }
         return true;
+    }
+
+    private bool IsDoorWelded(EntityUid uid)
+    {
+        foreach (var comp in EntityManager.GetComponents(uid))
+        {
+            if (string.Equals(comp.GetType().Name, "WeldableComponent", StringComparison.OrdinalIgnoreCase))
+                return GetBoolMember(comp, "IsWelded");
+        }
+        return true;
+    }
+
+    private bool IsDoorOpen(EntityUid uid)
+    {
+        foreach (var comp in EntityManager.GetComponents(uid))
+        {
+            if (string.Equals(comp.GetType().Name, "DoorComponent", StringComparison.OrdinalIgnoreCase))
+            {
+                var stateObj = GetMemberValue(comp, "State");
+                if (stateObj != null)
+                {
+                    var stateStr = stateObj.ToString() ?? string.Empty;
+                    return !string.Equals(stateStr, "Closed", StringComparison.OrdinalIgnoreCase) &&
+                           !string.Equals(stateStr, "Welded", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+        }
+        return false;
+    }
+
+    private bool IsDoorBolted(EntityUid uid)
+    {
+        foreach (var comp in EntityManager.GetComponents(uid))
+        {
+            if (string.Equals(comp.GetType().Name, "DoorBoltComponent", StringComparison.OrdinalIgnoreCase))
+            {
+                if (GetBoolMember(comp, "BoltsDown"))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private bool HasOpenWiresPanelWithUncutBuiWires(EntityUid uid)
+    {
+        if (!IsWirePanelOpen(uid))
+            return false;
+
+        if (TryGetOpenWiresBui(uid, out _, out _, out var wires) && wires.Count > 0)
+            return wires.Any(w => !w.IsCut);
+
+        return false;
+    }
+
+    private bool TryGetOpenWiresBui(
+        EntityUid target,
+        out UserInterfaceComponent uiComp,
+        out Enum wiresKey,
+        out List<(int Id, bool IsCut)> wires)
+    {
+        wires = new List<(int Id, bool IsCut)>();
+        wiresKey = WiresUiKey.Key;
+
+        if (!TryComp(target, out uiComp!))
+            return false;
+
+        foreach (var (key, bUi) in uiComp.ClientOpenInterfaces)
+        {
+            var keyTypeName = key.GetType().Name;
+            var stateObj = GetMemberValue(bUi, "State");
+            bool isWiresUi = key is WiresUiKey ||
+                             keyTypeName.Contains("WiresUiKey", StringComparison.OrdinalIgnoreCase) ||
+                             stateObj is WiresBoundUserInterfaceState ||
+                             (stateObj != null && stateObj.GetType().Name.Contains("WiresBoundUserInterfaceState", StringComparison.OrdinalIgnoreCase));
+
+            if (!isWiresUi)
+                continue;
+
+            wiresKey = key;
+            if (stateObj == null)
+                return false;
+
+            if (stateObj is WiresBoundUserInterfaceState typedState && typedState.WiresList != null)
+            {
+                foreach (var w in typedState.WiresList)
+                {
+                    wires.Add((w.Id, w.IsCut));
+                }
+                return true;
+            }
+
+            if (GetMemberValue(stateObj, "WiresList") is IEnumerable rawList)
+            {
+                foreach (var item in rawList)
+                {
+                    if (item == null)
+                        continue;
+
+                    int id = GetMemberValue(item, "Id") is int i ? i : 0;
+                    bool isCut = GetBoolMember(item, "IsCut");
+                    wires.Add((id, isCut));
+                }
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void SendWiresAction(
+        EntityUid target,
+        UserInterfaceComponent uiComp,
+        Enum wiresKey,
+        int wireId,
+        WiresAction action)
+    {
+        var msg = new WiresActionMessage(wireId, action);
+        _bui.ClientSendUiMessage((target, uiComp), wiresKey, msg);
+    }
+
+    private void ExecuteCutWiresStep(EntityUid player, float frameTime, ConstructionActionStep step)
+    {
+        if (!Exists(_currentTarget))
+            return;
+
+        // 1. Ensure wire panel is open before attempting to cut internal wires
+        if (!IsWirePanelOpen(_currentTarget))
+        {
+            if (!_itemUtil.TryEquipByPredicate(uid => _toolSystem.HasQuality(uid, "Screwing"), "Tool:Screwing"))
+            {
+                _log.Warning("Cannot open wire panel before cutting wires: no Screwing tool found.");
+                FinishCurrentPlan();
+                return;
+            }
+            _itemUtil.EnqueueClickEntity(_currentTarget);
+            _waitTimer = 0.35f;
+            return;
+        }
+
+        // 2. Check if the Wires BUI is open and its state (WiresList) has arrived from the server
+        if (!TryGetOpenWiresBui(_currentTarget, out var uiComp, out var wiresKey, out var wires))
+        {
+            if (!_solver.HasWiresUserInterface(_currentTarget))
+            {
+                // Entity does not use a Wires BUI (e.g. Shuttle Airlock); advance to next step
+                AdvancePastCutWiresStep(step);
+                return;
+            }
+
+            if (!_buiOpenRequestedForStep)
+            {
+                var held = _hands.GetActiveItem(player);
+                if (held == null || !Exists(held.Value) || !_toolSystem.HasQuality(held.Value, "Cutting"))
+                {
+                    if (!_itemUtil.TryEquipByPredicate(uid => _toolSystem.HasQuality(uid, "Cutting"), "Tool:Cutting"))
+                    {
+                        _log.Warning("Failed to equip Cutting tool to open wire panel UI.");
+                        FinishCurrentPlan();
+                        return;
+                    }
+                    return;
+                }
+
+                // Clicking the entity with wirecutters while its wire panel is open opens the WiresUiKey.Key BUI
+                _itemUtil.EnqueueClickEntity(_currentTarget);
+                _buiOpenRequestedForStep = true;
+                _rescanTimer = 0f;
+                _waitTimer = 0.35f;
+                return;
+            }
+
+            _rescanTimer += frameTime;
+            if (_rescanTimer >= 0.75f)
+            {
+                _rescanTimer = 0f;
+                _stepRetryCount++;
+                if (_stepRetryCount <= 3)
+                {
+                    _buiOpenRequestedForStep = false;
+                    return;
+                }
+
+                _log.Warning("Timed out waiting for Wires BUI state to open; advancing.");
+                AdvancePastCutWiresStep(step);
+            }
+            return;
+        }
+
+        // 3. If cutting the previous wire caused the door bolts to drop (Bolt wire cut while powered),
+        // mend the bolt wire, pulse it with a Multitool if available to raise the bolts, and defer cutting it until last!
+        if (_lastCutWireId.HasValue && IsDoorBolted(_currentTarget))
+        {
+            _deferredBoltWireId = _lastCutWireId.Value;
+            _lastCutWireId = null;
+            _pulsedDeferredBoltWire = false;
+        }
+
+        if (_deferredBoltWireId.HasValue && IsDoorBolted(_currentTarget))
+        {
+            int boltWireId = _deferredBoltWireId.Value;
+            var boltWireState = wires.FirstOrDefault(w => w.Id == boltWireId);
+
+            // 3a. If the bolt wire is currently cut, mend it first with Wirecutters so it can be pulsed
+            if (boltWireState.IsCut)
+            {
+                var held = _hands.GetActiveItem(player);
+                if (held == null || !Exists(held.Value) || !_toolSystem.HasQuality(held.Value, "Cutting"))
+                {
+                    _itemUtil.TryEquipByPredicate(uid => _toolSystem.HasQuality(uid, "Cutting"), "Tool:Cutting");
+                    return;
+                }
+
+                SendWiresAction(_currentTarget, uiComp, wiresKey, boltWireId, WiresAction.Mend);
+                _waitTimer = 0.35f;
+                return;
+            }
+
+            // 3b. Pulse the mended bolt wire with a Multitool (Pulsing) to raise the bolts back up
+            if (!_pulsedDeferredBoltWire)
+            {
+                var held = _hands.GetActiveItem(player);
+                if (held == null || !Exists(held.Value) || !_toolSystem.HasQuality(held.Value, "Pulsing"))
+                {
+                    if (_itemUtil.TryEquipByPredicate(uid => _toolSystem.HasQuality(uid, "Pulsing"), "Tool:Pulsing"))
+                        return;
+
+                    // No Multitool available; mark as attempted so we finish cutting remaining wires
+                    _pulsedDeferredBoltWire = true;
+                }
+                else
+                {
+                    SendWiresAction(_currentTarget, uiComp, wiresKey, boltWireId, WiresAction.Pulse);
+                    _pulsedDeferredBoltWire = true;
+                    _waitTimer = 0.35f;
+                    return;
+                }
+            }
+        }
+
+        // 4. Find all remaining uncut wires
+        var uncutWires = wires.Where(w => !w.IsCut).ToList();
+        if (uncutWires.Count == 0)
+        {
+            // All internal wires in the BUI are confirmed cut!
+            AdvancePastCutWiresStep(step);
+            return;
+        }
+
+        // If we already sent a Cut message for _lastCutWireId and it is still uncut in state,
+        // wait briefly for the server state update / WireDoAfterEvent before re-sending
+        if (_lastCutWireId.HasValue)
+        {
+            bool stillUncut = uncutWires.Any(w => w.Id == _lastCutWireId.Value);
+            if (!stillUncut)
+            {
+                // Wire finished cutting! Reset retry counter and immediately proceed to next wire
+                _lastCutWireId = null;
+                _wireCutPendingTimer = 0f;
+                _wireCutRetries = 0;
+            }
+            else if (_wireCutPendingTimer > 0f)
+            {
+                _wireCutPendingTimer -= frameTime;
+                return;
+            }
+            else
+            {
+                _wireCutRetries++;
+                if (_wireCutRetries > 4)
+                {
+                    _log.Warning($"Wire {_lastCutWireId.Value} did not cut after retries; stopping job.");
+                    FinishCurrentPlan();
+                    return;
+                }
+            }
+        }
+
+        // 5. Ensure a Cutting tool (Wirecutters) is equipped in the active hand before sending WiresAction.Cut
+        var activeItem = _hands.GetActiveItem(player);
+        if (activeItem == null || !Exists(activeItem.Value) || !_toolSystem.HasQuality(activeItem.Value, "Cutting"))
+        {
+            if (!_itemUtil.TryEquipByPredicate(uid => _toolSystem.HasQuality(uid, "Cutting"), "Tool:Cutting"))
+            {
+                _log.Warning("Failed to equip Cutting tool to cut internal wires.");
+                FinishCurrentPlan();
+                return;
+            }
+            return;
+        }
+
+        // 6. Pick the next uncut wire, keeping _deferredBoltWireId for very last (after power wires are cut)
+        var nextWire = uncutWires[0];
+        if (_deferredBoltWireId.HasValue && uncutWires.Count > 1)
+        {
+            foreach (var candidate in uncutWires)
+            {
+                if (candidate.Id != _deferredBoltWireId.Value)
+                {
+                    nextWire = candidate;
+                    break;
+                }
+            }
+        }
+
+        SendWiresAction(_currentTarget, uiComp, wiresKey, nextWire.Id, WiresAction.Cut);
+        _lastCutWireId = nextWire.Id;
+        _wireCutPendingTimer = 0.65f;
+        _waitTimer = 0.2f;
+    }
+
+    private void AdvancePastCutWiresStep(ConstructionActionStep step)
+    {
+        _buiOpenRequestedForStep = false;
+        _lastCutWireId = null;
+        _deferredBoltWireId = null;
+        _pulsedDeferredBoltWire = false;
+        _wireCutPendingTimer = 0f;
+        _wireCutRetries = 0;
+        _rescanTimer = 0f;
+        _stepRetryCount = 0;
+
+        // Only advance _stepIndex if this was a dedicated CutWires step;
+        // if we intercepted a UseTool("Cutting") step before its world interaction, let UseTool("Cutting") now run or advance if it was meant for wires.
+        if (step.Kind == ConstructionActionKind.CutWires)
+        {
+            _stepIndex++;
+        }
+        _phase = StepExecutionPhase.PrepareAndEquip;
+        _waitTimer = SettleDelay;
     }
 
     private bool PrepareAndEquipForStep(EntityUid player, ConstructionActionStep step)
@@ -1090,8 +1489,9 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             }
 
             case ConstructionActionKind.UseTool:
+            case ConstructionActionKind.CutWires:
             {
-                var quality = step.PrototypeOrQualityOrTag;
+                var quality = step.PrototypeOrQualityOrTag ?? "Cutting";
                 if (string.IsNullOrEmpty(quality))
                     return false;
 

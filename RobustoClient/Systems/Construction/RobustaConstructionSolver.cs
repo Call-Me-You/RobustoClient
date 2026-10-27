@@ -20,6 +20,7 @@ public enum ConstructionActionKind
     StartGhostConstruction,
     AddMaterial,
     UseTool,
+    CutWires,
     InsertPrototype,
     InsertComponent,
     InsertTag
@@ -654,10 +655,23 @@ public sealed class RobustaConstructionSolver : EntitySystem
 
             var steps = new List<ConstructionActionStep>();
             var firstEdge = edgePath[0].Edge;
+
+            if (ShouldWeldDoorBeforeDeconstruct(target, graph, currentNode, firstEdge))
+            {
+                steps.Add(new ConstructionActionStep(
+                    ConstructionActionKind.UseTool,
+                    "Weld door shut (Welding)",
+                    PrototypeOrQualityOrTag: "Welding",
+                    Amount: 1,
+                    DoAfterDelay: 1f,
+                    ExpectedNextNode: null));
+            }
+
             var panelComp = FindComponentByName(target, "WiresPanelComponent");
-            if (panelComp != null &&
-                GetMemberValue(panelComp, "Open") is false &&
-                ShouldOpenWirePanelBeforeEdge(graph, currentNode, firstEdge, panelComp))
+            bool opensOrNeedsWirePanel = panelComp != null &&
+                ShouldOpenWirePanelBeforeEdge(graph, currentNode, firstEdge, panelComp);
+
+            if (opensOrNeedsWirePanel && GetMemberValue(panelComp, "Open") is false)
             {
                 var openTool = GetStringMember(panelComp, "OpeningTool") ?? "Screwing";
                 steps.Add(new ConstructionActionStep(
@@ -666,6 +680,17 @@ public sealed class RobustaConstructionSolver : EntitySystem
                     PrototypeOrQualityOrTag: openTool,
                     Amount: 1,
                     DoAfterDelay: 0f,
+                    ExpectedNextNode: null));
+            }
+
+            if (ShouldCutInternalWiresBeforeEdge(target, graph, currentNode, firstEdge, panelComp))
+            {
+                steps.Add(new ConstructionActionStep(
+                    ConstructionActionKind.CutWires,
+                    "Cut internal wires (Cutting)",
+                    PrototypeOrQualityOrTag: "Cutting",
+                    Amount: 1,
+                    DoAfterDelay: 0.5f,
                     ExpectedNextNode: null));
             }
 
@@ -713,6 +738,115 @@ public sealed class RobustaConstructionSolver : EntitySystem
             return false;
 
         return true;
+    }
+
+    private bool ShouldWeldDoorBeforeDeconstruct(
+        EntityUid target,
+        ConstructionGraphPrototype graph,
+        ConstructionGraphNode currentNode,
+        ConstructionGraphEdge firstEdge)
+    {
+        if (TryGetEdgeDoorWeldedCondition(firstEdge, out bool requiredWelded))
+            return requiredWelded;
+
+        var weldableComp = FindComponentByName(target, "WeldableComponent");
+        if (weldableComp == null)
+            return false;
+
+        if (GetMemberValue(weldableComp, "IsWelded") is true)
+            return false;
+
+        var graphId = graph.ID ?? string.Empty;
+        var nodeName = GetNodeName(currentNode);
+        if (graphId.Contains("Airlock", StringComparison.OrdinalIgnoreCase) ||
+            nodeName.Contains("airlock", StringComparison.OrdinalIgnoreCase) ||
+            FindComponentByName(target, "AirlockComponent") != null)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool ShouldCutInternalWiresBeforeEdge(
+        EntityUid target,
+        ConstructionGraphPrototype graph,
+        ConstructionGraphNode currentNode,
+        ConstructionGraphEdge firstEdge,
+        IComponent? panelComp)
+    {
+        if (TryGetEdgeAllWiresCutCondition(firstEdge, out bool requiredAllCut))
+            return requiredAllCut;
+
+        var graphId = graph.ID ?? string.Empty;
+        var nodeName = GetNodeName(currentNode);
+
+        // Consoles and standard MachineFrames do not require cutting all hacking wires to deconstruct
+        if (string.Equals(graphId, "Computer", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(graphId, "Machine", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(graphId, "AirlockShuttle", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(nodeName, "computer", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(nodeName, "machine", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // Airlocks and Windoors require all internal wires in the wire panel to be cut before prying/unwrenching
+        if (string.Equals(graphId, "Airlock", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(graphId, "Windoor", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(nodeName, "airlock", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(nodeName, "windoor", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (panelComp != null && HasWiresUserInterface(target))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    public bool HasWiresUserInterface(EntityUid target)
+    {
+        var uiComp = FindComponentByName(target, "UserInterfaceComponent");
+        if (uiComp == null)
+            return false;
+
+        if (GetMemberValue(uiComp, "ClientOpenInterfaces") is IDictionary openDict)
+        {
+            foreach (DictionaryEntry entry in openDict)
+            {
+                var keyType = entry.Key?.GetType().Name ?? string.Empty;
+                if (keyType.Contains("WiresUiKey", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+
+        if (GetMemberValue(uiComp, "Interfaces") is IDictionary interfacesDict)
+        {
+            foreach (DictionaryEntry entry in interfacesDict)
+            {
+                var keyType = entry.Key?.GetType().Name ?? string.Empty;
+                if (keyType.Contains("WiresUiKey", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+
+        // Prototype fallback if Interfaces dictionary is private/inaccessible
+        var proto = _entMan.GetComponent<MetaDataComponent>(target).EntityPrototype;
+        if (proto != null &&
+            (FindComponentByName(target, "AirlockComponent") != null ||
+             FindComponentByName(target, "DoorBoltComponent") != null ||
+             FindComponentByName(target, "WiresVisualsComponent") != null ||
+             _itemUtil.HasPrototypeComponent(proto, "Wires") ||
+             _itemUtil.HasPrototypeComponent(proto, "WiresPanelSecurity")))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     public bool DoesEdgeReplaceOrDeleteEntity(EntityUid currentTarget, string graphId, string? expectedNextNode)
@@ -771,6 +905,14 @@ public sealed class RobustaConstructionSolver : EntitySystem
              string.Equals(nodeName, "missingWires", StringComparison.OrdinalIgnoreCase)))
         {
             return "MachineFrame";
+        }
+
+        if (string.Equals(graph.ID, "Airlock", StringComparison.OrdinalIgnoreCase) &&
+            (string.Equals(nodeName, "assembly", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(nodeName, "wired", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(nodeName, "electronics", StringComparison.OrdinalIgnoreCase)))
+        {
+            return "AirlockAssembly";
         }
 
         return null;
@@ -1465,6 +1607,38 @@ public sealed class RobustaConstructionSolver : EntitySystem
         return false;
     }
 
+    private bool TryGetEdgeDoorWeldedCondition(ConstructionGraphEdge edge, out bool requiredWelded)
+    {
+        requiredWelded = true;
+        foreach (var cond in EnumerateEdgeConditions(edge))
+        {
+            if (cond.GetType().Name.Contains("DoorWelded", StringComparison.OrdinalIgnoreCase))
+            {
+                if (GetMemberValue(cond, "Welded") is bool b)
+                    requiredWelded = b;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private bool TryGetEdgeAllWiresCutCondition(ConstructionGraphEdge edge, out bool requiredAllCut)
+    {
+        requiredAllCut = true;
+        foreach (var cond in EnumerateEdgeConditions(edge))
+        {
+            var cName = cond.GetType().Name;
+            if (cName.Contains("AllWiresCut", StringComparison.OrdinalIgnoreCase) ||
+                cName.Contains("WiresCut", StringComparison.OrdinalIgnoreCase))
+            {
+                if (GetMemberValue(cond, "Value") is bool b)
+                    requiredAllCut = b;
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static IEnumerable<object> EnumerateEdgeConditions(ConstructionGraphEdge edge)
     {
         var conds = GetMemberValue(edge, "Conditions") as IEnumerable
@@ -1952,6 +2126,8 @@ public sealed class RobustaConstructionSolver : EntitySystem
             return (float)d;
         if (val is int i)
             return i;
+        if (val is TimeSpan ts)
+            return (float)ts.TotalSeconds;
         try
         {
             return Convert.ToSingle(val);
