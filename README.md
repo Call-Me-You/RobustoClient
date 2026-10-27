@@ -3,6 +3,7 @@
 ![GitHub release](https://flat.badgen.net/github/release/Gerkada/RobustoClient)
 ![.NET](https://img.shields.io/badge/.NET-10.0-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square)
+[![Discord](https://img.shields.io/badge/Discord-Join_Community-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/XkujzBJSkz)
 
 Based on the original [ArabicaClient](https://github.com/noverd/ArabicaCliento) by noverd. Massive thanks for the foundational framework.
 
@@ -26,6 +27,7 @@ To run this, you need [MarseyLoader](https://github.com/ValidHunters/Marseyloade
 If you want to build the client from source for development purposes:
 
 1. Clone the repository:
+
 ```bash
 git clone --recurse-submodules -j4 [https://github.com/Gerkada/RobustoClient.git](https://github.com/Gerkada/RobustoClient.git)
 ```
@@ -62,8 +64,12 @@ dotnet build RobustoClient/RobustoClient.csproj -c Release
 - **Command Permissions Patch** – Patch for working with local command privileges.
 - **FOV Toggler** – Bindable key to quickly toggle Field of View.
 
+## Community & Support
+Need help with installation, want to report a bug, or just chat with other users?  
+**[Join the official Discord server!](https://discord.gg/XkujzBJSkz)**
+
 ## Contributions
-I welcome any contributions to the client. If you have ideas for improvements, new features, or find a bug, please open a ticket in the Issues section on GitHub.
+I welcome any contributions to the client. If you have ideas for improvements, new features, or find a bug, please open a ticket in the Issues section on GitHub or discuss it in our Discord.
 
 ## License
 This project is licensed under the [GPL-3.0 License](LICENSE).
