@@ -51,6 +51,8 @@ public static class RobustaConfig
 
     public static Keyboard.Key AutoDeconstructKey = Keyboard.Key.N;
 
+    public static Keyboard.Key HackingKey = Keyboard.Key.H;
+
     public static bool ThrowAimbotEnabled = true;
 
     public static float AimFovPixels { get; set; } = 100f; // Aimbot capture radius in pixels (Screen FOV)

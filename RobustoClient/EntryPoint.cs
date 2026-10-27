@@ -48,6 +48,15 @@ public sealed class EntryPoint : GameShared
             Type = KeyBindingType.Command
         };
         _inputManager.RegisterBinding(shiftDeconstructRegistration, false);
+
+        var hackingRegistration = new KeyBindingRegistration
+        {
+            Function = "robusta.hack",
+            BaseKey = RobustaConfig.HackingKey,
+            Type = KeyBindingType.Command
+        };
+        _inputManager.RegisterBinding(hackingRegistration, false);
+
         MarseyLogger.Debug("Setup context.");
     }
 }

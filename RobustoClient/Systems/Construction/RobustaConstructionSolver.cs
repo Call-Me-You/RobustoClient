@@ -570,6 +570,77 @@ public sealed class RobustaConstructionSolver : EntitySystem
             Steps: steps);
     }
 
+    /// <summary>
+    /// Solves the construction graph from the entity's current node to an explicit target node.
+    /// </summary>
+    public SolvedConstructionPlan? SolvePlanToNode(EntityUid target, string targetNodeName)
+    {
+        if (!_entMan.EntityExists(target) || string.IsNullOrWhiteSpace(targetNodeName))
+            return null;
+
+        EnsureCacheInitialized();
+        if (!TryResolveGraphAndNode(target, out var graph, out var currentNode, out _) ||
+            graph == null || currentNode == null)
+        {
+            return null;
+        }
+
+        var currentNodeName = GetNodeName(currentNode);
+        if (string.Equals(currentNodeName, targetNodeName, StringComparison.OrdinalIgnoreCase))
+            return new SolvedConstructionPlan(graph.ID, currentNodeName, targetNodeName, false, []);
+
+        var edgePath = FindShortestEdgePath(graph, currentNodeName, targetNodeName);
+        if (edgePath == null || edgePath.Count == 0)
+            return null;
+
+        var steps = new List<ConstructionActionStep>();
+        for (var i = 0; i < edgePath.Count; i++)
+        {
+            var (fromNode, edge, toNode) = edgePath[i];
+            AppendAnchorTransitionStepIfNeeded(
+                target,
+                i == 0,
+                graph,
+                fromNode,
+                edge,
+                toNode,
+                isDeconstruct: false,
+                steps);
+            ConvertEdgeSteps(edge, GetNodeName(toNode), steps);
+        }
+
+        return new SolvedConstructionPlan(graph.ID, currentNodeName, targetNodeName, false, steps);
+    }
+
+    public static string? GetSecurityRemovalTarget(string? examine)
+    {
+        return examine switch
+        {
+            "wires-panel-component-on-examine-security-level1" => "medSecurityUnfinished",
+            "wires-panel-component-on-examine-security-level2" => "medSecurity",
+            "wires-panel-component-on-examine-security-level3" => "highSecurityUnfinished",
+            "wires-panel-component-on-examine-security-level4" => "highSecurity",
+            "wires-panel-component-on-examine-security-level5" => "maxSecurity",
+            "wires-panel-component-on-examine-security-level6" => "superMaxSecurityUnfinished",
+            "wires-panel-component-on-examine-security-level7" => "superMaxSecurity",
+            _ => null
+        };
+    }
+
+    public static string? GetNextSecurityNode(string node)
+    {
+        return node switch
+        {
+            "medSecurity" => "medSecurityUnfinished",
+            "highSecurity" => "highSecurityUnfinished",
+            "maxSecurity" => "highSecurity",
+            "superMaxSecurity" => "superMaxSecurityUnfinished",
+            "superMaxSecurityUnfinished" => "maxSecurity",
+            "medSecurityUnfinished" or "highSecurityUnfinished" => "airlock",
+            _ => null
+        };
+    }
+
     public SolvedConstructionPlan? SolveBuildPlan(ConstructionPrototype constructionProto, bool includeGhostStart = true)
     {
         EnsureCacheInitialized();
@@ -683,21 +754,20 @@ public sealed class RobustaConstructionSolver : EntitySystem
                     ExpectedNextNode: null));
             }
 
-            if (ShouldCutInternalWiresBeforeEdge(target, graph, currentNode, firstEdge, panelComp))
-            {
-                steps.Add(new ConstructionActionStep(
-                    ConstructionActionKind.CutWires,
-                    "Cut internal wires (Cutting)",
-                    PrototypeOrQualityOrTag: "Cutting",
-                    Amount: 1,
-                    DoAfterDelay: 0.5f,
-                    ExpectedNextNode: null));
-            }
-
             for (int i = 0; i < edgePath.Count; i++)
             {
                 var (fromNode, edge, toNode) = edgePath[i];
                 bool isFirstEdge = i == 0;
+                if (ShouldCutInternalWiresBeforeEdge(target, graph, fromNode, edge, panelComp))
+                {
+                    steps.Add(new ConstructionActionStep(
+                        ConstructionActionKind.CutWires,
+                        "Cut internal wires (Cutting)",
+                        PrototypeOrQualityOrTag: "Cutting",
+                        Amount: 1,
+                        DoAfterDelay: 0.5f,
+                        ExpectedNextNode: null));
+                }
                 AppendAnchorTransitionStepIfNeeded(target, isFirstEdge, graph, fromNode, edge, toNode, isDeconstruct: true, steps);
                 ConvertEdgeSteps(edge, GetNodeName(toNode), steps);
             }
@@ -1024,6 +1094,19 @@ public sealed class RobustaConstructionSolver : EntitySystem
                     var chosen = SelectBestNodeCandidate(target, candidates);
                     graph = chosen.Graph;
                     node = chosen.Node;
+
+                    // If this is an Airlock with active WiresPanelSecurityComponent, resolve its current security node
+                    if (string.Equals(graph.ID, "Airlock", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var secComp = FindComponentByName(target, "WiresPanelSecurityComponent");
+                        if (secComp != null && GetMemberValue(secComp, "WiresAccessible") is false)
+                        {
+                            var secNodeName = GetSecurityRemovalTarget(GetStringMember(secComp, "Examine"));
+                            if (!string.IsNullOrEmpty(secNodeName) && TryGetNodeByName(graph, secNodeName, out var secNode))
+                                node = secNode;
+                        }
+                    }
+
                     return true;
                 }
 
