@@ -78,6 +78,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     private EntityUid? _litWelderUid;
     private EntityUid _stepStartTarget;
     private string? _stepStartNode;
+    private EntityUid? _stepStartHeldItem;
+    private int _stepStartHeldStackCount;
     private int _stepRetryCount;
     private int _welderIgniteRetries;
     private bool _sawDoAfterForStep;
@@ -176,6 +178,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
         if (_player.LocalEntity is not { } player || !Exists(player))
             return;
+
+        _solver.NoteHeldEntity(_hands.GetActiveItem(player));
 
         var mouseScreenPos = _input.MouseScreenPosition;
         var cursorMapCoords = _eye.PixelToMap(mouseScreenPos);
@@ -281,6 +285,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         _wasInDoAfter = false;
         _stepStartTarget = EntityUid.Invalid;
         _stepStartNode = null;
+        _stepStartHeldItem = null;
+        _stepStartHeldStackCount = 0;
         _stepRetryCount = 0;
         _welderIgniteRetries = 0;
         _sawDoAfterForStep = false;
@@ -393,6 +399,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             StopJob();
             return;
         }
+
+        _solver.NoteHeldEntity(_hands.GetActiveItem(player));
 
         // Check DoAfter state BEFORE _itemUtil.IsBusy so short DoAfters starting during post-click delay are never missed
         if (IsPlayerInActiveDoAfter(player))
@@ -528,8 +536,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 if (_clientConstruction.TrySpawnGhost(cProto, tileCoords, task.Dir, out var ghostUid) &&
                     ghostUid != null && Exists(ghostUid.Value))
                 {
-                    var ghostPlan = _solver.SolveBuildPlan(cProto, includeGhostStart: true)
-                                    ?? _solver.SolveBuildPlan(ghostUid.Value);
+                    var ghostPlan = _solver.SolveBuildPlan(cProto, includeGhostStart: true, desiredEntityProtoId: task.Item.EntityPrototypeId)
+                                    ?? _solver.SolveBuildPlan(ghostUid.Value, task.Item.EntityPrototypeId);
                     if (ghostPlan != null && ghostPlan.Steps.Count > 0)
                     {
                         StartJob(ghostUid.Value, ghostPlan);
@@ -700,6 +708,17 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             return;
         }
 
+        // Skip redundant board-pry step on MachineFrame if no board is inside
+        if (step.Kind == ConstructionActionKind.UseTool &&
+            step.Description.StartsWith("Pry out board", StringComparison.OrdinalIgnoreCase) &&
+            Exists(_currentTarget) &&
+            !_solver.HasMachineFrameBoard(_currentTarget))
+        {
+            _stepIndex++;
+            _phase = StepExecutionPhase.PrepareAndEquip;
+            return;
+        }
+
         // Delegate BUI wire-cutting step (or Cutting step when open wire panel still has uncut BUI wires) to RobustaWiresSolver
         if (step.Kind == ConstructionActionKind.CutWires ||
             (step.Kind == ConstructionActionKind.UseTool &&
@@ -814,6 +833,11 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 _stepStartNode = _solver.TryResolveGraphAndNode(_currentTarget, out _, out var sNode, out _) && sNode != null
                     ? sNode.Name
                     : null;
+                var activeHeldAtStart = _hands.GetActiveItem(player);
+                _stepStartHeldItem = activeHeldAtStart;
+                _stepStartHeldStackCount = activeHeldAtStart.HasValue && TryComp<StackComponent>(activeHeldAtStart.Value, out var startStack)
+                    ? startStack.Count
+                    : (activeHeldAtStart.HasValue ? 1 : 0);
 
                 if (step.Kind == ConstructionActionKind.UseTool &&
                     step.Description.StartsWith("Weld door shut", StringComparison.OrdinalIgnoreCase) &&
@@ -993,6 +1017,82 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     return;
                 }
 
+                // Verify MachineFrame board/parts pry-out actually took effect before cutting wires
+                if (step.Kind == ConstructionActionKind.UseTool &&
+                    step.Description.StartsWith("Pry out board", StringComparison.OrdinalIgnoreCase) &&
+                    Exists(_currentTarget) &&
+                    _solver.HasMachineFrameBoard(_currentTarget))
+                {
+                    _rescanTimer += frameTime;
+                    if (_rescanTimer >= 0.65f)
+                    {
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        if (_stepRetryCount <= 3)
+                        {
+                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            return;
+                        }
+
+                        _log.Warning($"Step '{step.Description}' did not eject board from machine frame after retries; stopping job.");
+                        FinishCurrentPlan();
+                    }
+                    return;
+                }
+
+                // Verify item/material insertions actually consumed or inserted the held item before stowing/advancing
+                if (step.Kind is ConstructionActionKind.InsertPrototype
+                              or ConstructionActionKind.InsertComponent
+                              or ConstructionActionKind.InsertTag
+                              or ConstructionActionKind.AddMaterial &&
+                    _stepStartHeldItem.HasValue &&
+                    Exists(_stepStartHeldItem.Value) &&
+                    _hands.GetActiveItem(player) == _stepStartHeldItem)
+                {
+                    int curCount = TryComp<StackComponent>(_stepStartHeldItem.Value, out var curSt) ? curSt.Count : 1;
+                    bool consumed = curCount < _stepStartHeldStackCount;
+                    if (!consumed &&
+                        (string.Equals(step.PrototypeOrQualityOrTag, "MachineBoard", StringComparison.OrdinalIgnoreCase) ||
+                         _solver.IsMachineBoardEntity(_stepStartHeldItem.Value)) &&
+                        Exists(_currentTarget) &&
+                        _solver.HasMachineFrameBoard(_currentTarget))
+                    {
+                        consumed = true;
+                    }
+
+                    if (!consumed)
+                    {
+                        _rescanTimer += frameTime;
+                        if (_rescanTimer >= 0.55f)
+                        {
+                            _rescanTimer = 0f;
+                            _stepRetryCount++;
+                            if (_stepRetryCount <= 2)
+                            {
+                                _phase = StepExecutionPhase.PrepareAndEquip;
+                                return;
+                            }
+
+                            // If inserting a part/material into a MachineFrame that already has its board,
+                            // that specific requirement slot may already be satisfied; advance to the next step.
+                            if (string.Equals(_activePlan.GraphId, "Machine", StringComparison.OrdinalIgnoreCase) &&
+                                Exists(_currentTarget) &&
+                                _solver.HasMachineFrameBoard(_currentTarget) &&
+                                !_solver.IsMachineBoardEntity(_stepStartHeldItem.Value))
+                            {
+                                _stepIndex++;
+                                _stepRetryCount = 0;
+                                _phase = StepExecutionPhase.PrepareAndEquip;
+                                return;
+                            }
+
+                            _log.Warning($"Step '{step.Description}' did not consume held item after retries; stopping job.");
+                            FinishCurrentPlan();
+                        }
+                        return;
+                    }
+                }
+
                 // Verify Unanchor / Anchor transitions actually took effect before advancing
                 if (step.Kind == ConstructionActionKind.UseTool &&
                     string.Equals(step.PrototypeOrQualityOrTag, "Anchoring", StringComparison.OrdinalIgnoreCase) &&
@@ -1061,6 +1161,35 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         }
 
                         _log.Warning($"Step '{step.Description}' did not transition to node '{step.ExpectedNextNode}' after retries; stopping job.");
+                        FinishCurrentPlan();
+                    }
+                    return;
+                }
+
+                // If this step transitions an in-place frame node (e.g. MachineFrame missingWires <-> machineFrame,
+                // or ComputerFrame stages 0..4) without replacing the entity, verify the node changed before advancing.
+                if (isFinalStepOfEdge &&
+                    !expectsEntityReplacement &&
+                    !string.IsNullOrEmpty(step.ExpectedNextNode) &&
+                    !string.Equals(step.ExpectedNextNode, _stepStartNode, StringComparison.OrdinalIgnoreCase) &&
+                    Exists(_currentTarget) &&
+                    _solver.CanVerifyInPlaceNodeTransition(_currentTarget, _activePlan.GraphId) &&
+                    _solver.TryResolveGraphAndNode(_currentTarget, out _, out var currentFrameNode, out _) &&
+                    currentFrameNode != null &&
+                    !string.Equals(currentFrameNode.Name, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase))
+                {
+                    _rescanTimer += frameTime;
+                    if (_rescanTimer >= 0.65f)
+                    {
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        if (_stepRetryCount <= 3)
+                        {
+                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            return;
+                        }
+
+                        _log.Warning($"Step '{step.Description}' did not reach frame node '{step.ExpectedNextNode}' after retries; stopping job.");
                         FinishCurrentPlan();
                     }
                     return;
@@ -1198,10 +1327,18 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 if (_itemUtil.TryEquipItem(new ProtoId<StackPrototype>(matId), step.Amount))
                     return true;
 
+                if (_itemUtil.TryEquipByPredicate(
+                        uid => TryComp<StackComponent>(uid, out var stack) &&
+                               string.Equals(stack.StackTypeId, matId, StringComparison.OrdinalIgnoreCase),
+                        $"Material:{matId}",
+                        step.Amount))
+                {
+                    return true;
+                }
+
                 return _itemUtil.TryEquipByPredicate(
-                    uid => TryComp<StackComponent>(uid, out var stack) &&
-                           string.Equals(stack.StackTypeId, matId, StringComparison.OrdinalIgnoreCase),
-                    $"Material:{matId}",
+                    uid => MatchesMachinePart(uid, matId),
+                    $"MaterialOrPart:{matId}",
                     step.Amount);
             }
 
@@ -1231,6 +1368,23 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 var compName = step.PrototypeOrQualityOrTag;
                 if (string.IsNullOrEmpty(compName))
                     return false;
+
+                if (string.Equals(compName, "MachineBoard", StringComparison.OrdinalIgnoreCase))
+                {
+                    return _itemUtil.TryEquipByPredicate(
+                        uid => _solver.IsMachineBoardEntity(uid),
+                        "Component:MachineBoard",
+                        step.Amount);
+                }
+
+                if (compName.StartsWith("MachinePart:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var partId = compName["MachinePart:".Length..];
+                    return _itemUtil.TryEquipByPredicate(
+                        uid => MatchesMachinePart(uid, partId),
+                        $"MachinePart:{partId}",
+                        step.Amount);
+                }
 
                 return _itemUtil.TryEquipByPredicate(
                     uid =>
@@ -1267,6 +1421,49 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             default:
                 return false;
         }
+    }
+
+    private bool MatchesMachinePart(EntityUid uid, string partId)
+    {
+        if (!Exists(uid) || string.IsNullOrEmpty(partId))
+            return false;
+
+        if (TryComp<StackComponent>(uid, out var stack) &&
+            string.Equals(stack.StackTypeId, partId, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        foreach (var comp in EntityManager.GetComponents(uid))
+        {
+            if (string.Equals(comp.GetType().Name, "MachinePartComponent", StringComparison.OrdinalIgnoreCase))
+            {
+                var partVal = GetMemberValue(comp, "Part") ?? GetMemberValue(comp, "PartType");
+                var partStr = GetMemberValue(partVal, "Id") as string ?? partVal?.ToString();
+                if (string.Equals(partStr, partId, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+
+        var proto = MetaData(uid).EntityPrototype;
+        if (proto != null)
+        {
+            if (_itemUtil.TryGetPrototypeComponent<object>(proto, "MachinePart", out var mpComp) && mpComp != null)
+            {
+                var partVal = GetMemberValue(mpComp, "Part") ?? GetMemberValue(mpComp, "PartType");
+                var partStr = GetMemberValue(partVal, "Id") as string ?? partVal?.ToString();
+                if (string.Equals(partStr, partId, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            if (proto.ID.Contains(partId, StringComparison.OrdinalIgnoreCase) &&
+                proto.ID.Contains("StockPart", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return _tagSystem.HasTag(uid, partId);
     }
 
     private void StartGhostConstruction(EntityUid ghostUid)
