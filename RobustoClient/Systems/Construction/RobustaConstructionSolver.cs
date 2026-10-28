@@ -62,6 +62,13 @@ public sealed class RobustaConstructionSolver : EntitySystem
     private readonly Dictionary<string, string> _entityToConstructionProto =
         new(StringComparer.OrdinalIgnoreCase);
 
+    private readonly Dictionary<(string BaseProtoId, int PipeLayer), string> _entityAltLayerProtos = new();
+
+    private readonly Dictionary<string, (string BaseProtoId, int PipeLayer)> _altEntityToBaseAndLayer =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly Dictionary<(string BaseRecipeId, int PipeLayer), string> _constructionAltLayerProtos = new();
+
     private static readonly string[] PrimaryDeconstructTargets =
     {
         "start",
@@ -206,6 +213,9 @@ public sealed class RobustaConstructionSolver : EntitySystem
         _entityToGraphNodes.Clear();
         _graphToConstructionProtos.Clear();
         _entityToConstructionProto.Clear();
+        _entityAltLayerProtos.Clear();
+        _altEntityToBaseAndLayer.Clear();
+        _constructionAltLayerProtos.Clear();
     }
 
     public void EnsureCacheInitialized()
@@ -217,6 +227,9 @@ public sealed class RobustaConstructionSolver : EntitySystem
         _entityToGraphNodes.Clear();
         _graphToConstructionProtos.Clear();
         _entityToConstructionProto.Clear();
+        _entityAltLayerProtos.Clear();
+        _altEntityToBaseAndLayer.Clear();
+        _constructionAltLayerProtos.Clear();
 
         foreach (var cProto in _protoMan.EnumeratePrototypes<ConstructionPrototype>())
         {
@@ -240,6 +253,8 @@ public sealed class RobustaConstructionSolver : EntitySystem
                 if (!string.IsNullOrEmpty(targetEntId) && !_entityToConstructionProto.ContainsKey(targetEntId))
                     _entityToConstructionProto[targetEntId] = cProto.ID;
             }
+
+            RegisterConstructionAlternativePrototypes(cProto);
         }
 
         foreach (var graph in _protoMan.EnumeratePrototypes<ConstructionGraphPrototype>())
@@ -300,9 +315,11 @@ public sealed class RobustaConstructionSolver : EntitySystem
             }
         }
 
-        // Map EntityPrototypes that declare ConstructionComponent, Computer/Machine components, or are constructed from boards
+        // Map EntityPrototypes that declare ConstructionComponent, AtmosPipeLayers, Computer/Machine components, or are constructed from boards
         foreach (var entityProto in _protoMan.EnumeratePrototypes<EntityPrototype>())
         {
+            RegisterEntityAlternativePipeLayers(entityProto);
+
             if (TryGetConstructionMappingFromPrototype(entityProto, out var graphId, out var nodeName) &&
                 TryGetGraph(graphId, out var graph) &&
                 TryGetNodeByName(graph, nodeName, out var node))
@@ -541,10 +558,10 @@ public sealed class RobustaConstructionSolver : EntitySystem
             }
 
             if (cProto != null)
-                return SolveBuildPlan(cProto, includeGhostStart: true);
+                return SolveBuildPlan(cProto, includeGhostStart: true, desiredEntityProtoId: desiredEntityProtoId);
         }
 
-        // Case B: target is an in-world frame/unfinished structure
+        // Case B: target is an in-world frame/unfinished structure or an unconfigured atmos contraption
         if (!TryResolveGraphAndNode(target, out var graph, out var currentNode, out var explicitTargetNode) ||
             graph == null || currentNode == null)
         {
@@ -553,16 +570,31 @@ public sealed class RobustaConstructionSolver : EntitySystem
 
         var currentNodeName = GetNodeName(currentNode);
         var targetNodeName = explicitTargetNode;
+        int desiredPipeLayer = GetDesiredPipeLayer(desiredEntityProtoId, null);
 
-        if (!string.IsNullOrEmpty(desiredEntityProtoId) &&
-            _entityToGraphNodes.TryGetValue(desiredEntityProtoId, out var desiredNodes))
+        if (!string.IsNullOrEmpty(desiredEntityProtoId))
         {
-            foreach (var (dGraph, dNode) in desiredNodes)
+            if (_entityToGraphNodes.TryGetValue(desiredEntityProtoId, out var desiredNodes))
             {
-                if (string.Equals(dGraph.ID, graph.ID, StringComparison.OrdinalIgnoreCase))
+                foreach (var (dGraph, dNode) in desiredNodes)
                 {
-                    targetNodeName = GetNodeName(dNode);
-                    break;
+                    if (string.Equals(dGraph.ID, graph.ID, StringComparison.OrdinalIgnoreCase))
+                    {
+                        targetNodeName = GetNodeName(dNode);
+                        break;
+                    }
+                }
+            }
+            else if (TryExtractPipeLayerSuffix(desiredEntityProtoId, out var baseDesiredId, out _) &&
+                     _entityToGraphNodes.TryGetValue(baseDesiredId, out var baseNodes))
+            {
+                foreach (var (dGraph, dNode) in baseNodes)
+                {
+                    if (string.Equals(dGraph.ID, graph.ID, StringComparison.OrdinalIgnoreCase))
+                    {
+                        targetNodeName = GetNodeName(dNode);
+                        break;
+                    }
                 }
             }
         }
@@ -570,6 +602,34 @@ public sealed class RobustaConstructionSolver : EntitySystem
         if (string.IsNullOrEmpty(targetNodeName) ||
             string.Equals(targetNodeName, currentNodeName, StringComparison.OrdinalIgnoreCase))
         {
+            // If this is already an unanchored pipe/contraption or an unconfigured contraption at its base node
+            if (IsPipeOrAtmosGraphOrNode(graph, currentNode, target))
+            {
+                int curLayer = DetectEntityPipeLayer(target, out _);
+                bool isAnchored = _entMan.GetComponent<TransformComponent>(target).Anchored;
+                bool canScrewdriver = ShouldUseScrewdriverForPipeLayer(graph, currentNode, desiredEntityProtoId);
+                if (!isAnchored || (canScrewdriver && desiredPipeLayer != curLayer && !string.IsNullOrEmpty(desiredEntityProtoId)))
+                {
+                    var layerSteps = new List<ConstructionActionStep>();
+                    if (!isAnchored)
+                        AppendPostBuildPipeAnchorStepIfNeeded(target, graph, currentNode, layerSteps);
+                    if (canScrewdriver && !string.IsNullOrEmpty(desiredEntityProtoId) && desiredPipeLayer != curLayer)
+                        AppendPipeLayerScrewdriverSteps(curLayer, desiredPipeLayer, layerSteps);
+
+                    if (layerSteps.Count > 0)
+                    {
+                        TryExtractPipeLayerSuffix(currentNodeName, out var baseCurNode, out _);
+                        var finalNodeLabel = desiredPipeLayer > 0 ? $"{baseCurNode}Alt{desiredPipeLayer}" : baseCurNode;
+                        return new SolvedConstructionPlan(
+                            graph.ID,
+                            currentNodeName,
+                            finalNodeLabel,
+                            IsDeconstruct: false,
+                            Steps: layerSteps);
+                    }
+                }
+            }
+
             targetNodeName = FindBestBuildTargetNode(graph, currentNode);
         }
 
@@ -580,17 +640,49 @@ public sealed class RobustaConstructionSolver : EntitySystem
         }
 
         var edgePath = FindShortestEdgePath(graph, currentNodeName, targetNodeName);
-        if (edgePath == null || edgePath.Count == 0)
-            return null;
+        if ((edgePath == null || edgePath.Count == 0) &&
+            TryExtractPipeLayerSuffix(targetNodeName, out var fallbackBaseTargetNode, out _) &&
+            !string.Equals(fallbackBaseTargetNode, targetNodeName, StringComparison.OrdinalIgnoreCase))
+        {
+            targetNodeName = fallbackBaseTargetNode;
+            if (!string.Equals(targetNodeName, currentNodeName, StringComparison.OrdinalIgnoreCase))
+                edgePath = FindShortestEdgePath(graph, currentNodeName, targetNodeName);
+        }
 
         var steps = new List<ConstructionActionStep>();
-        for (int i = 0; i < edgePath.Count; i++)
+        ConstructionGraphNode finalBuiltNode = currentNode;
+
+        if (edgePath != null && edgePath.Count > 0)
         {
-            var (fromNode, edge, toNode) = edgePath[i];
-            bool isFirstEdge = i == 0;
-            AppendAnchorTransitionStepIfNeeded(target, isFirstEdge, graph, fromNode, edge, toNode, isDeconstruct: false, steps);
-            AppendMachineFrameStepsIfNeeded(target, graph, fromNode, toNode, desiredEntityProtoId, steps);
-            ConvertEdgeSteps(edge, GetNodeName(toNode), steps);
+            for (int i = 0; i < edgePath.Count; i++)
+            {
+                var (fromNode, edge, toNode) = edgePath[i];
+                bool isFirstEdge = i == 0;
+                AppendAnchorTransitionStepIfNeeded(target, isFirstEdge, graph, fromNode, edge, toNode, isDeconstruct: false, steps);
+                AppendMachineFrameStepsIfNeeded(target, graph, fromNode, toNode, desiredEntityProtoId, steps);
+                ConvertEdgeSteps(edge, GetNodeName(toNode), steps);
+            }
+            finalBuiltNode = edgePath[^1].To;
+        }
+        else if (!IsPipeOrAtmosGraphOrNode(graph, currentNode, target))
+        {
+            return null;
+        }
+
+        AppendPostBuildPipeAnchorStepIfNeeded(target, graph, finalBuiltNode, steps);
+
+        if (ShouldUseScrewdriverForPipeLayer(graph, finalBuiltNode, desiredEntityProtoId) &&
+            !string.IsNullOrEmpty(desiredEntityProtoId))
+        {
+            int builtLayer = edgePath != null && edgePath.Count > 0
+                ? GetPipeLayerForIdOrNode(GetNodeName(finalBuiltNode))
+                : DetectEntityPipeLayer(target, out _);
+            if (desiredPipeLayer != builtLayer)
+            {
+                AppendPipeLayerScrewdriverSteps(builtLayer, desiredPipeLayer, steps);
+                TryExtractPipeLayerSuffix(GetNodeName(finalBuiltNode), out var baseBuiltNode, out _);
+                targetNodeName = desiredPipeLayer > 0 ? $"{baseBuiltNode}Alt{desiredPipeLayer}" : baseBuiltNode;
+            }
         }
 
         if (steps.Count == 0)
@@ -734,6 +826,22 @@ public sealed class RobustaConstructionSolver : EntitySystem
             AppendAnchorTransitionStepIfNeeded(null, isFirstEdge, graph, fromNode, edge, toNode, isDeconstruct: false, steps);
             AppendMachineFrameStepsIfNeeded(null, graph, fromNode, toNode, desiredEntityProtoId, steps);
             ConvertEdgeSteps(edge, GetNodeName(toNode), steps);
+        }
+
+        var finalNode = edgePath[^1].To;
+        AppendPostBuildPipeAnchorStepIfNeeded(null, graph, finalNode, steps);
+
+        if (ShouldUseScrewdriverForPipeLayer(graph, finalNode, desiredEntityProtoId) &&
+            !string.IsNullOrEmpty(desiredEntityProtoId))
+        {
+            int builtLayer = GetPipeLayerForIdOrNode(targetNodeName);
+            int desiredLayer = GetDesiredPipeLayer(desiredEntityProtoId, targetNodeName);
+            if (desiredLayer != builtLayer)
+            {
+                AppendPipeLayerScrewdriverSteps(builtLayer, desiredLayer, steps);
+                TryExtractPipeLayerSuffix(targetNodeName, out var baseTargetNode, out _);
+                targetNodeName = desiredLayer > 0 ? $"{baseTargetNode}Alt{desiredLayer}" : baseTargetNode;
+            }
         }
 
         return new SolvedConstructionPlan(
@@ -1066,17 +1174,87 @@ public sealed class RobustaConstructionSolver : EntitySystem
         if (_protoMan.TryIndex<ConstructionPrototype>(entityProtoId, out var sameIdProto))
             return sameIdProto.ID;
 
-        // Walk EntityPrototype and its parents to see if any maps to a (Graph, Node) -> ConstructionPrototype
+        // Check if this is an Alt1 / Alt2 / Secondary / Tertiary pipe-layer entity prototype
+        int desiredLayer = GetDesiredPipeLayer(entityProtoId, null);
+        string? baseProtoId = null;
+        if (_altEntityToBaseAndLayer.TryGetValue(entityProtoId, out var baseAndLayer))
+        {
+            baseProtoId = baseAndLayer.BaseProtoId;
+            if (desiredLayer == 0)
+                desiredLayer = baseAndLayer.PipeLayer;
+        }
+        else if (TryExtractPipeLayerSuffix(entityProtoId, out var extractedBase, out int extractedLayer) && extractedLayer > 0)
+        {
+            baseProtoId = extractedBase;
+            if (desiredLayer == 0)
+                desiredLayer = extractedLayer;
+        }
+
+        if (!string.IsNullOrEmpty(baseProtoId) && desiredLayer > 0)
+        {
+            var baseRecipeId = ResolveBaseConstructionPrototypeOnly(baseProtoId);
+            if (!string.IsNullOrEmpty(baseRecipeId))
+            {
+                if (_constructionAltLayerProtos.TryGetValue((baseRecipeId, desiredLayer), out var altRecipeId) &&
+                    _protoMan.HasIndex<ConstructionPrototype>(altRecipeId))
+                {
+                    return altRecipeId;
+                }
+
+                var suffix = desiredLayer == 1 ? "Alt1" : "Alt2";
+                if (_protoMan.TryIndex<ConstructionPrototype>(baseRecipeId + suffix, out var suffixedCProto))
+                    return suffixedCProto.ID;
+
+                if (_protoMan.TryIndex<ConstructionPrototype>(baseRecipeId, out var baseCProto))
+                {
+                    var baseGraphId = GetStringMember(baseCProto, "Graph");
+                    var baseTargetNode = GetStringMember(baseCProto, "TargetNode");
+                    if (!string.IsNullOrEmpty(baseGraphId) &&
+                        !string.IsNullOrEmpty(baseTargetNode) &&
+                        _graphToConstructionProtos.TryGetValue(baseGraphId, out var graphCProtos))
+                    {
+                        var desiredNodeName = baseTargetNode + suffix;
+                        foreach (var cp in graphCProtos)
+                        {
+                            if (string.Equals(GetStringMember(cp, "TargetNode"), desiredNodeName, StringComparison.OrdinalIgnoreCase))
+                                return cp.ID;
+                        }
+                    }
+                }
+
+                return baseRecipeId;
+            }
+        }
+
+        return ResolveBaseConstructionPrototypeOnly(entityProtoId);
+    }
+
+    private string? ResolveBaseConstructionPrototypeOnly(string entityProtoId)
+    {
+        if (string.IsNullOrEmpty(entityProtoId))
+            return null;
+
+        if (_entityToConstructionProto.TryGetValue(entityProtoId, out var directProtoId))
+            return directProtoId;
+
+        if (_protoMan.TryIndex<ConstructionPrototype>(entityProtoId, out var sameIdProto))
+            return sameIdProto.ID;
+
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var queue = new Queue<string>();
         queue.Enqueue(entityProtoId);
         visited.Add(entityProtoId);
+
+        string? firstGraphFallback = null;
 
         while (queue.Count > 0)
         {
             var curId = queue.Dequeue();
             if (_entityToConstructionProto.TryGetValue(curId, out var mappedId))
                 return mappedId;
+
+            if (_protoMan.TryIndex<ConstructionPrototype>(curId, out var curSameIdProto))
+                return curSameIdProto.ID;
 
             if (_entityToGraphNodes.TryGetValue(curId, out var graphNodes))
             {
@@ -1092,8 +1270,25 @@ public sealed class RobustaConstructionSolver : EntitySystem
                             return cp.ID;
                     }
 
-                    return cProtos[0].ID;
+                    if (TryExtractPipeLayerSuffix(nodeName, out var baseNodeName, out _) &&
+                        !string.Equals(baseNodeName, nodeName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        foreach (var cp in cProtos)
+                        {
+                            if (string.Equals(GetStringMember(cp, "TargetNode"), baseNodeName, StringComparison.OrdinalIgnoreCase))
+                                return cp.ID;
+                        }
+                    }
+
+                    firstGraphFallback ??= cProtos[0].ID;
                 }
+            }
+
+            if (TryExtractPipeLayerSuffix(curId, out var strippedId, out _) &&
+                !string.Equals(strippedId, curId, StringComparison.OrdinalIgnoreCase) &&
+                visited.Add(strippedId))
+            {
+                queue.Enqueue(strippedId);
             }
 
             if (_protoMan.TryIndex<EntityPrototype>(curId, out var eProto) && eProto.Parents != null)
@@ -1106,7 +1301,7 @@ public sealed class RobustaConstructionSolver : EntitySystem
             }
         }
 
-        return null;
+        return firstGraphFallback;
     }
 
     public bool TryResolveGraphAndNode(
@@ -1623,10 +1818,20 @@ public sealed class RobustaConstructionSolver : EntitySystem
             foreach (var edge in GetNodeEdges(current))
             {
                 var edgeTargetName = GetStringMember(edge, "Target");
-                if (string.IsNullOrEmpty(edgeTargetName) || !visited.Add(edgeTargetName))
+                if (string.IsNullOrEmpty(edgeTargetName))
                     continue;
 
                 if (!TryGetNodeByName(graph, edgeTargetName, out var nextNode))
+                    continue;
+
+                // Never traverse through a terminal deconstruction node (like "start") as an intermediate step
+                if (!string.Equals(edgeTargetName, targetNodeName, StringComparison.OrdinalIgnoreCase) &&
+                    IsTerminalDeconstructNode(graph, nextNode))
+                {
+                    continue;
+                }
+
+                if (!visited.Add(edgeTargetName))
                     continue;
 
                 cameFrom[edgeTargetName] = (current, edge);
@@ -1669,6 +1874,10 @@ public sealed class RobustaConstructionSolver : EntitySystem
         {
             return;
         }
+
+        // Never attempt to anchor the "start" ghost node before the structure is even spawned
+        if (!isDeconstruct && string.Equals(fromName, "start", StringComparison.OrdinalIgnoreCase))
+            return;
 
         // 1. Check explicit EntityAnchored condition on the edge if present on the client
         if (TryGetEdgeAnchoredCondition(edge, out bool requiredAnchored))
@@ -1713,9 +1922,8 @@ public sealed class RobustaConstructionSolver : EntitySystem
         }
         else
         {
-            // Anchoring frames/assemblies/pipes that spawn unanchored (skipped automatically at runtime if already anchored)
-            if (KnownAnchorableFrameNodes.Contains(fromName) ||
-                IsPipeOrAtmosGraphOrNode(graph, fromNode, target))
+            // Anchoring intermediate frames/assemblies that spawn unanchored (skipped automatically at runtime if already anchored)
+            if (KnownAnchorableFrameNodes.Contains(fromName))
             {
                 steps.Add(new ConstructionActionStep(
                     ConstructionActionKind.UseTool,
@@ -1727,6 +1935,712 @@ public sealed class RobustaConstructionSolver : EntitySystem
             }
         }
     }
+
+    private void AppendPostBuildPipeAnchorStepIfNeeded(
+        EntityUid? target,
+        ConstructionGraphPrototype graph,
+        ConstructionGraphNode finalNode,
+        List<ConstructionActionStep> steps)
+    {
+        if (!IsPipeOrAtmosGraphOrNode(graph, finalNode, target))
+            return;
+
+        if (steps.Count > 0 &&
+            steps[^1].Kind == ConstructionActionKind.UseTool &&
+            string.Equals(steps[^1].PrototypeOrQualityOrTag, "Anchoring", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        steps.Add(new ConstructionActionStep(
+            ConstructionActionKind.UseTool,
+            "Anchor frame (Anchoring)",
+            PrototypeOrQualityOrTag: "Anchoring",
+            Amount: 1,
+            DoAfterDelay: 1f,
+            ExpectedNextNode: null));
+    }
+
+    private void RegisterConstructionAlternativePrototypes(ConstructionPrototype cProto)
+    {
+        var altObj = GetMemberValue(cProto, "AlternativePrototypes") ?? GetMemberValue(cProto, "_alternativePrototypes");
+        if (altObj is IDictionary dict)
+        {
+            foreach (DictionaryEntry entry in dict)
+            {
+                if (TryParsePipeLayerValue(entry.Key, out int layer) && layer > 0)
+                {
+                    var altId = ExtractIdString(entry.Value);
+                    if (!string.IsNullOrEmpty(altId))
+                        _constructionAltLayerProtos[(cProto.ID, layer)] = altId;
+                }
+            }
+        }
+        else if (altObj is IEnumerable enumerable && altObj is not string)
+        {
+            int idx = 0;
+            foreach (var item in enumerable)
+            {
+                var altId = ExtractIdString(item);
+                if (!string.IsNullOrEmpty(altId) && !string.Equals(altId, cProto.ID, StringComparison.OrdinalIgnoreCase))
+                {
+                    int layer = GetPipeLayerForIdOrNode(altId);
+                    if (layer == 0 && idx >= 1 && idx <= 2)
+                        layer = idx;
+                    if (layer > 0)
+                        _constructionAltLayerProtos[(cProto.ID, layer)] = altId;
+                }
+                idx++;
+            }
+        }
+    }
+
+    private void RegisterEntityAlternativePipeLayers(EntityPrototype entityProto)
+    {
+        if (TryExtractPipeLayerSuffix(entityProto.ID, out var baseFromId, out int layerFromId) && layerFromId > 0)
+        {
+            _entityAltLayerProtos[(baseFromId, layerFromId)] = entityProto.ID;
+            _altEntityToBaseAndLayer[entityProto.ID] = (baseFromId, layerFromId);
+        }
+
+        if (!_itemUtil.TryGetPrototypeComponent<object>(entityProto, "AtmosPipeLayers", out var pipeLayersComp) ||
+            pipeLayersComp == null)
+        {
+            return;
+        }
+
+        var altObj = GetMemberValue(pipeLayersComp, "AlternativePrototypes") ??
+                     GetMemberValue(pipeLayersComp, "_alternativePrototypes");
+        if (altObj is IDictionary dict)
+        {
+            string? primaryId = null;
+            foreach (DictionaryEntry entry in dict)
+            {
+                if (TryParsePipeLayerValue(entry.Key, out int l) && l == 0)
+                {
+                    primaryId = ExtractIdString(entry.Value);
+                    break;
+                }
+            }
+
+            primaryId ??= TryExtractPipeLayerSuffix(entityProto.ID, out var stripped, out _) ? stripped : entityProto.ID;
+
+            foreach (DictionaryEntry entry in dict)
+            {
+                if (TryParsePipeLayerValue(entry.Key, out int layer) && layer > 0)
+                {
+                    var altId = ExtractIdString(entry.Value);
+                    if (!string.IsNullOrEmpty(altId))
+                    {
+                        _entityAltLayerProtos[(primaryId, layer)] = altId;
+                        _altEntityToBaseAndLayer[altId] = (primaryId, layer);
+                    }
+                }
+            }
+        }
+    }
+
+    public void ResolveExportBlueprintPrototypes(
+        EntityUid uid,
+        string rawEntityProtoId,
+        out string exportedEntityProtoId,
+        out string? exportedConstructionProtoId)
+    {
+        EnsureCacheInitialized();
+
+        if (rawEntityProtoId.Contains("Manifold", StringComparison.OrdinalIgnoreCase))
+        {
+            exportedEntityProtoId = TryExtractPipeLayerSuffix(rawEntityProtoId, out var baseManifold, out _)
+                ? baseManifold
+                : rawEntityProtoId;
+            exportedConstructionProtoId = ResolveConstructionPrototypeForEntity(exportedEntityProtoId);
+            return;
+        }
+
+        exportedEntityProtoId = rawEntityProtoId;
+        int pipeLayer = DetectEntityPipeLayer(uid, out var detectedAltProtoId);
+
+        if (pipeLayer > 0)
+        {
+            if (!string.IsNullOrEmpty(detectedAltProtoId))
+            {
+                exportedEntityProtoId = detectedAltProtoId;
+            }
+            else if (TryExtractPipeLayerSuffix(rawEntityProtoId, out var baseId, out int existingLayer) && existingLayer == pipeLayer)
+            {
+                exportedEntityProtoId = rawEntityProtoId;
+            }
+            else
+            {
+                var cleanBase = TryExtractPipeLayerSuffix(rawEntityProtoId, out var b, out _) ? b : rawEntityProtoId;
+                if (_entityAltLayerProtos.TryGetValue((cleanBase, pipeLayer), out var mappedAlt))
+                {
+                    exportedEntityProtoId = mappedAlt;
+                }
+                else
+                {
+                    var suffix = pipeLayer == 1 ? "Alt1" : "Alt2";
+                    exportedEntityProtoId = cleanBase + suffix;
+                }
+            }
+        }
+
+        exportedConstructionProtoId = ResolveConstructionPrototypeForEntity(exportedEntityProtoId);
+    }
+
+    public int DetectEntityPipeLayer(EntityUid uid, out string? altEntityProtoId)
+    {
+        altEntityProtoId = null;
+        if (!_entMan.EntityExists(uid))
+            return 0;
+
+        EnsureCacheInitialized();
+
+        var protoId = _entMan.GetComponent<MetaDataComponent>(uid).EntityPrototype?.ID ?? string.Empty;
+        if (!string.IsNullOrEmpty(protoId))
+        {
+            // Manifolds bridge all 3 pipe layers simultaneously and never have a single Alt1/Alt2 pipe layer
+            if (protoId.Contains("Manifold", StringComparison.OrdinalIgnoreCase))
+            {
+                altEntityProtoId = TryExtractPipeLayerSuffix(protoId, out var baseManifold, out _) ? baseManifold : protoId;
+                return 0;
+            }
+
+            if (_altEntityToBaseAndLayer.TryGetValue(protoId, out var cached))
+            {
+                altEntityProtoId = protoId;
+                return cached.PipeLayer;
+            }
+
+            if (TryExtractPipeLayerSuffix(protoId, out _, out int suffixLayer) && suffixLayer > 0)
+            {
+                altEntityProtoId = protoId;
+                return suffixLayer;
+            }
+
+            // Standard pipes (GasPipe*, DisposalPipe*) encode their layer directly in their EntityPrototype ID
+            // (e.g. GasPipeStraight, GasPipeStraightAlt1, GasPipeBendAlt2) and are placed directly without screwdriving.
+            if (protoId.Contains("GasPipe", StringComparison.OrdinalIgnoreCase) ||
+                protoId.Contains("DisposalPipe", StringComparison.OrdinalIgnoreCase))
+            {
+                return 0;
+            }
+        }
+
+        int detectedLayer = 0;
+        IDictionary? liveAltProtos = null;
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+        // 1. Inspect AtmosPipeLayersComponent and all live components for AtmosPipeLayer / PipeLayer fields or properties
+        foreach (var comp in _entMan.GetComponents(uid))
+        {
+            var compType = comp.GetType();
+            var compName = compType.Name;
+            if (compName is "TransformComponent" or "MetaDataComponent" or "PhysicsComponent" or "FixturesComponent")
+                continue;
+
+            if (liveAltProtos == null &&
+                (GetMemberValue(comp, "AlternativePrototypes") ?? GetMemberValue(comp, "_alternativePrototypes")) is IDictionary altDict)
+            {
+                liveAltProtos = altDict;
+            }
+
+            if (compName.Contains("PipeLayer", StringComparison.OrdinalIgnoreCase) ||
+                compName.Contains("AtmosPipe", StringComparison.OrdinalIgnoreCase))
+            {
+                var rawLayer = GetMemberValue(comp, "CurrentPipeLayer")
+                               ?? GetMemberValue(comp, "PipeLayer")
+                               ?? GetMemberValue(comp, "Layer")
+                               ?? GetMemberValue(comp, "CurrentLayer");
+                if (TryParsePipeLayerValue(rawLayer, out int compLayer) && compLayer > 0)
+                {
+                    detectedLayer = compLayer;
+                    break;
+                }
+            }
+
+            foreach (var prop in compType.GetProperties(flags))
+            {
+                if (prop.GetIndexParameters().Length > 0)
+                    continue;
+
+                var pTypeName = prop.PropertyType.Name;
+                bool isPipeLayerMember = pTypeName.Contains("PipeLayer", StringComparison.OrdinalIgnoreCase) ||
+                                         prop.Name.Contains("PipeLayer", StringComparison.OrdinalIgnoreCase);
+                if (isPipeLayerMember || prop.PropertyType.IsEnum)
+                {
+                    try
+                    {
+                        var val = prop.GetValue(comp);
+                        if (isPipeLayerMember)
+                        {
+                            if (TryParsePipeLayerValue(val, out int pLayer) && pLayer > 0)
+                            {
+                                detectedLayer = pLayer;
+                                break;
+                            }
+                        }
+                        else if (val is Enum eVal)
+                        {
+                            var eStr = eVal.ToString();
+                            if (eStr.Equals("Secondary", StringComparison.OrdinalIgnoreCase) ||
+                                eStr.Equals("Alt1", StringComparison.OrdinalIgnoreCase))
+                            {
+                                detectedLayer = 1;
+                                break;
+                            }
+                            if (eStr.Equals("Tertiary", StringComparison.OrdinalIgnoreCase) ||
+                                eStr.Equals("Alt2", StringComparison.OrdinalIgnoreCase))
+                            {
+                                detectedLayer = 2;
+                                break;
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore reflection getter exceptions
+                    }
+                }
+            }
+
+            if (detectedLayer > 0)
+                break;
+
+            foreach (var field in compType.GetFields(flags))
+            {
+                var fTypeName = field.FieldType.Name;
+                bool isPipeLayerField = fTypeName.Contains("PipeLayer", StringComparison.OrdinalIgnoreCase) ||
+                                        field.Name.Contains("PipeLayer", StringComparison.OrdinalIgnoreCase);
+                if (isPipeLayerField || field.FieldType.IsEnum)
+                {
+                    try
+                    {
+                        var val = field.GetValue(comp);
+                        if (isPipeLayerField)
+                        {
+                            if (TryParsePipeLayerValue(val, out int fLayer) && fLayer > 0)
+                            {
+                                detectedLayer = fLayer;
+                                break;
+                            }
+                        }
+                        else if (val is Enum eVal)
+                        {
+                            var eStr = eVal.ToString();
+                            if (eStr.Equals("Secondary", StringComparison.OrdinalIgnoreCase) ||
+                                eStr.Equals("Alt1", StringComparison.OrdinalIgnoreCase))
+                            {
+                                detectedLayer = 1;
+                                break;
+                            }
+                            if (eStr.Equals("Tertiary", StringComparison.OrdinalIgnoreCase) ||
+                                eStr.Equals("Alt2", StringComparison.OrdinalIgnoreCase))
+                            {
+                                detectedLayer = 2;
+                                break;
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore
+                    }
+                }
+            }
+
+            if (detectedLayer > 0)
+                break;
+        }
+
+        // 2. Inspect NodeContainerComponent PipeNodes if present on client
+        if (detectedLayer == 0 && !protoId.Contains("Manifold", StringComparison.OrdinalIgnoreCase))
+        {
+            var nodeCont = FindComponentByName(uid, "NodeContainerComponent");
+            if (nodeCont != null &&
+                (GetMemberValue(nodeCont, "Nodes") ?? GetMemberValue(nodeCont, "_nodes")) is IDictionary nodesDict)
+            {
+                var foundLayers = new HashSet<int>();
+                int primaryPipeNodeLayer = 0;
+
+                foreach (DictionaryEntry entry in nodesDict)
+                {
+                    var nodeObj = entry.Value;
+                    if (nodeObj == null)
+                        continue;
+
+                    var rawNodeLayer = GetMemberValue(nodeObj, "CurrentPipeLayer")
+                                       ?? GetMemberValue(nodeObj, "PipeLayer")
+                                       ?? GetMemberValue(nodeObj, "Layer");
+                    if (TryParsePipeLayerValue(rawNodeLayer, out int nLayer))
+                    {
+                        foundLayers.Add(nLayer);
+                        var nodeKey = entry.Key?.ToString() ?? string.Empty;
+                        if (nLayer > 0 &&
+                            (nodeKey.Equals("pipe", StringComparison.OrdinalIgnoreCase) ||
+                             nodeKey.Equals("inlet", StringComparison.OrdinalIgnoreCase) ||
+                             nodeKey.Equals("port", StringComparison.OrdinalIgnoreCase)))
+                        {
+                            primaryPipeNodeLayer = nLayer;
+                        }
+                    }
+                }
+
+                if (foundLayers.Count == 1)
+                {
+                    int single = foundLayers.First();
+                    if (single > 0)
+                        detectedLayer = single;
+                }
+                else if (primaryPipeNodeLayer > 0 && foundLayers.Count < 3)
+                {
+                    detectedLayer = primaryPipeNodeLayer;
+                }
+            }
+        }
+
+        // 3. Inspect AppearanceComponent.AppearanceData for AtmosPipeLayer / PipeVisuals
+        if (detectedLayer == 0)
+        {
+            var appComp = FindComponentByName(uid, "AppearanceComponent");
+            if (appComp != null &&
+                (GetMemberValue(appComp, "AppearanceData") ?? GetMemberValue(appComp, "_appearanceData")) is IDictionary appDict)
+            {
+                foreach (DictionaryEntry entry in appDict)
+                {
+                    if (entry.Value is Enum valEnum)
+                    {
+                        var enumStr = valEnum.ToString();
+                        if (enumStr.Equals("Secondary", StringComparison.OrdinalIgnoreCase) ||
+                            enumStr.Equals("Alt1", StringComparison.OrdinalIgnoreCase))
+                        {
+                            detectedLayer = 1;
+                            break;
+                        }
+                        if (enumStr.Equals("Tertiary", StringComparison.OrdinalIgnoreCase) ||
+                            enumStr.Equals("Alt2", StringComparison.OrdinalIgnoreCase))
+                        {
+                            detectedLayer = 2;
+                            break;
+                        }
+                    }
+
+                    var keyType = entry.Key?.GetType().Name ?? string.Empty;
+                    var keyStr = entry.Key?.ToString() ?? string.Empty;
+                    var valType = entry.Value?.GetType().Name ?? string.Empty;
+                    if (keyType.Contains("PipeLayer", StringComparison.OrdinalIgnoreCase) ||
+                        keyStr.Contains("PipeLayer", StringComparison.OrdinalIgnoreCase) ||
+                        valType.Contains("PipeLayer", StringComparison.OrdinalIgnoreCase) ||
+                        keyType.Contains("AtmosPipe", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (TryParsePipeLayerValue(entry.Value, out int appLayer) && appLayer > 0)
+                        {
+                            detectedLayer = appLayer;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Inspect SpriteComponent visible layers for Alt1/Alt2 or Secondary/Tertiary RSI states
+        if (detectedLayer == 0)
+        {
+            var spriteComp = FindComponentByName(uid, "SpriteComponent");
+            if (spriteComp != null)
+            {
+                var layers = GetMemberValue(spriteComp, "AllLayers") as IEnumerable
+                             ?? GetMemberValue(spriteComp, "_layers") as IEnumerable;
+                if (layers != null)
+                {
+                    foreach (var entry in layers)
+                    {
+                        if (entry == null)
+                            continue;
+
+                        var layer = entry is DictionaryEntry de ? de.Value : GetMemberValue(entry, "Value") ?? entry;
+                        if (layer == null)
+                            continue;
+
+                        if (GetMemberValue(layer, "Visible") is false)
+                            continue;
+
+                        var stateObj = GetMemberValue(layer, "State");
+                        var stateName = GetStringMember(stateObj, "Name")
+                                        ?? GetStringMember(layer, "RsiState")
+                                        ?? stateObj?.ToString()
+                                        ?? string.Empty;
+                        var rsiObj = GetMemberValue(layer, "Rsi") ?? GetMemberValue(layer, "ActualRsi");
+                        var rsiPath = GetStringMember(rsiObj, "Path") ?? rsiObj?.ToString() ?? string.Empty;
+
+                        bool isFrame = protoId.Contains("Frame", StringComparison.OrdinalIgnoreCase);
+                        if (stateName.Contains("Alt1", StringComparison.OrdinalIgnoreCase) ||
+                            stateName.Contains("Secondary", StringComparison.OrdinalIgnoreCase) ||
+                            (!isFrame && stateName.EndsWith("_1", StringComparison.OrdinalIgnoreCase)) ||
+                            rsiPath.Contains("alt1", StringComparison.OrdinalIgnoreCase) ||
+                            rsiPath.Contains("secondary", StringComparison.OrdinalIgnoreCase))
+                        {
+                            detectedLayer = 1;
+                            break;
+                        }
+
+                        if (stateName.Contains("Alt2", StringComparison.OrdinalIgnoreCase) ||
+                            stateName.Contains("Tertiary", StringComparison.OrdinalIgnoreCase) ||
+                            (!isFrame && stateName.EndsWith("_2", StringComparison.OrdinalIgnoreCase)) ||
+                            rsiPath.Contains("alt2", StringComparison.OrdinalIgnoreCase) ||
+                            rsiPath.Contains("tertiary", StringComparison.OrdinalIgnoreCase))
+                        {
+                            detectedLayer = 2;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (detectedLayer > 0)
+        {
+            if (liveAltProtos != null)
+            {
+                foreach (DictionaryEntry entry in liveAltProtos)
+                {
+                    if (TryParsePipeLayerValue(entry.Key, out int kLayer) && kLayer == detectedLayer)
+                    {
+                        var candidate = ExtractIdString(entry.Value);
+                        if (!string.IsNullOrEmpty(candidate))
+                        {
+                            altEntityProtoId = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (string.IsNullOrEmpty(altEntityProtoId) && !string.IsNullOrEmpty(protoId))
+            {
+                var cleanBase = TryExtractPipeLayerSuffix(protoId, out var b, out _) ? b : protoId;
+                if (_entityAltLayerProtos.TryGetValue((cleanBase, detectedLayer), out var cachedAlt))
+                {
+                    altEntityProtoId = cachedAlt;
+                }
+                else
+                {
+                    var suffix = detectedLayer == 1 ? "Alt1" : "Alt2";
+                    altEntityProtoId = cleanBase + suffix;
+                }
+            }
+        }
+
+        return detectedLayer;
+    }
+
+    public bool ShouldUseScrewdriverForPipeLayer(
+        ConstructionGraphPrototype graph,
+        ConstructionGraphNode node,
+        string? desiredEntityProtoId)
+    {
+        if (!IsPipeOrAtmosGraphOrNode(graph, node, null))
+            return false;
+
+        var graphId = graph.ID ?? string.Empty;
+        var nodeName = GetNodeName(node);
+        var protoId = desiredEntityProtoId ?? string.Empty;
+
+        // Pipes (GasPipe / DisposalPipe) and Manifolds are placed directly on their target layer via ConstructionPrototype,
+        // never via Screwdriver cycling. Only use Screwdriver cycling for contraptions (connectors, mixers, filters, vents, etc.).
+        if (graphId.Equals("GasPipe", StringComparison.OrdinalIgnoreCase) ||
+            graphId.Contains("Disposal", StringComparison.OrdinalIgnoreCase) ||
+            nodeName.Contains("manifold", StringComparison.OrdinalIgnoreCase) ||
+            protoId.Contains("GasPipe", StringComparison.OrdinalIgnoreCase) ||
+            protoId.Contains("DisposalPipe", StringComparison.OrdinalIgnoreCase) ||
+            protoId.Contains("Manifold", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    public int GetDesiredPipeLayer(string? entityProtoId, string? fallbackNodeOrRecipeId)
+    {
+        EnsureCacheInitialized();
+
+        if (!string.IsNullOrEmpty(entityProtoId))
+        {
+            if (entityProtoId.Contains("Manifold", StringComparison.OrdinalIgnoreCase))
+                return 0;
+
+            if (_altEntityToBaseAndLayer.TryGetValue(entityProtoId, out var cached))
+                return cached.PipeLayer;
+
+            if (TryExtractPipeLayerSuffix(entityProtoId, out _, out int layer) && layer > 0)
+                return layer;
+        }
+
+        if (!string.IsNullOrEmpty(fallbackNodeOrRecipeId))
+        {
+            if (fallbackNodeOrRecipeId.Contains("Manifold", StringComparison.OrdinalIgnoreCase))
+                return 0;
+
+            if (TryExtractPipeLayerSuffix(fallbackNodeOrRecipeId, out _, out int fbLayer) && fbLayer > 0)
+                return fbLayer;
+        }
+
+        return 0;
+    }
+
+    public static int GetPipeLayerForIdOrNode(string? idOrNodeName)
+    {
+        return TryExtractPipeLayerSuffix(idOrNodeName, out _, out int layer) ? layer : 0;
+    }
+
+    public string NormalizeBaseEntityPrototypeId(string? protoId)
+    {
+        if (string.IsNullOrEmpty(protoId))
+            return string.Empty;
+
+        EnsureCacheInitialized();
+
+        if (_altEntityToBaseAndLayer.TryGetValue(protoId, out var cached))
+            return cached.BaseProtoId;
+
+        return TryExtractPipeLayerSuffix(protoId, out var baseId, out _) ? baseId : protoId;
+    }
+
+    public static bool TryExtractPipeLayerSuffix(string? id, out string baseId, out int pipeLayer)
+    {
+        baseId = id ?? string.Empty;
+        pipeLayer = 0;
+        if (string.IsNullOrEmpty(id))
+            return false;
+
+        if (id.EndsWith("Alt1", StringComparison.OrdinalIgnoreCase))
+        {
+            baseId = id[..^4];
+            pipeLayer = 1;
+            return true;
+        }
+
+        if (id.EndsWith("Alt2", StringComparison.OrdinalIgnoreCase))
+        {
+            baseId = id[..^4];
+            pipeLayer = 2;
+            return true;
+        }
+
+        if (id.EndsWith("Secondary", StringComparison.OrdinalIgnoreCase) && id.Length > 9)
+        {
+            baseId = id[..^9];
+            pipeLayer = 1;
+            return true;
+        }
+
+        if (id.EndsWith("Tertiary", StringComparison.OrdinalIgnoreCase) && id.Length > 8)
+        {
+            baseId = id[..^8];
+            pipeLayer = 2;
+            return true;
+        }
+
+        if (id.EndsWith("Alt1Flipped", StringComparison.OrdinalIgnoreCase) && id.Length > 11)
+        {
+            baseId = id[..^11] + "Flipped";
+            pipeLayer = 1;
+            return true;
+        }
+
+        if (id.EndsWith("Alt2Flipped", StringComparison.OrdinalIgnoreCase) && id.Length > 11)
+        {
+            baseId = id[..^11] + "Flipped";
+            pipeLayer = 2;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryParsePipeLayerValue(object? val, out int pipeLayer)
+    {
+        pipeLayer = 0;
+        if (val == null)
+            return false;
+
+        var str = val.ToString() ?? string.Empty;
+        if (str.Equals("Primary", StringComparison.OrdinalIgnoreCase) ||
+            str.Equals("Center", StringComparison.OrdinalIgnoreCase) ||
+            str.Equals("0", StringComparison.OrdinalIgnoreCase))
+        {
+            pipeLayer = 0;
+            return true;
+        }
+
+        if (str.Equals("Secondary", StringComparison.OrdinalIgnoreCase) ||
+            str.Equals("Alt1", StringComparison.OrdinalIgnoreCase) ||
+            str.Equals("1", StringComparison.OrdinalIgnoreCase))
+        {
+            pipeLayer = 1;
+            return true;
+        }
+
+        if (str.Equals("Tertiary", StringComparison.OrdinalIgnoreCase) ||
+            str.Equals("Alt2", StringComparison.OrdinalIgnoreCase) ||
+            str.Equals("2", StringComparison.OrdinalIgnoreCase))
+        {
+            pipeLayer = 2;
+            return true;
+        }
+
+        if (val is Enum or int or byte or sbyte or short or ushort)
+        {
+            try
+            {
+                int v = Convert.ToInt32(val);
+                if (v >= 0 && v <= 2)
+                {
+                    pipeLayer = v;
+                    return true;
+                }
+            }
+            catch
+            {
+                // Ignore
+            }
+        }
+
+        return false;
+    }
+
+    private static void AppendPipeLayerScrewdriverSteps(
+        int currentLayer,
+        int desiredLayer,
+        List<ConstructionActionStep> steps)
+    {
+        int cur = ((currentLayer % 3) + 3) % 3;
+        int dst = ((desiredLayer % 3) + 3) % 3;
+        if (cur == dst)
+            return;
+
+        int clicks = (dst - cur + 3) % 3;
+        for (int i = 1; i <= clicks; i++)
+        {
+            int stepTargetLayer = (cur + i) % 3;
+            string label = stepTargetLayer switch
+            {
+                1 => "Alt1/Secondary",
+                2 => "Alt2/Tertiary",
+                _ => "Primary"
+            };
+
+            steps.Add(new ConstructionActionStep(
+                ConstructionActionKind.UseTool,
+                $"Set pipe layer to {label} (Screwing)",
+                PrototypeOrQualityOrTag: "Screwing",
+                Amount: 1,
+                DoAfterDelay: 0.25f,
+                ExpectedNextNode: null));
+        }
+    }
+
 
     private bool IsTerminalDeconstructNode(ConstructionGraphPrototype graph, ConstructionGraphNode toNode)
     {
@@ -2186,9 +3100,9 @@ public sealed class RobustaConstructionSolver : EntitySystem
             foreach (var loc in candidates)
             {
                 var proto = _entMan.GetComponent<MetaDataComponent>(loc.Entity).EntityPrototype;
-                IComponent? boardComp = FindComponentByName(loc.Entity, "MachineBoardComponent");
+                object? boardComp = FindComponentByName(loc.Entity, "MachineBoardComponent");
                 if (boardComp == null && proto != null)
-                    _itemUtil.TryGetPrototypeComponent<IComponent>(proto, "MachineBoard", out boardComp);
+                    _itemUtil.TryGetPrototypeComponent<object>(proto, "MachineBoard", out boardComp);
 
                 var builtProto = GetStringMember(boardComp, "Prototype")
                                  ?? GetStringMember(boardComp, "MachinePrototype")

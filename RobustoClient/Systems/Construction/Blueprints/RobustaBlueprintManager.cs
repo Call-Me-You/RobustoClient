@@ -354,8 +354,16 @@ public sealed class RobustaBlueprintManager : EntitySystem
             if (tileX < minX || tileX > maxX || tileY < minY || tileY > maxY)
                 return;
 
-            var constructionProtoId = MapPrototypeToConstructionPrototype(protoId);
-            var phase = ClassifyZPhase(uid, protoId);
+            _solver.ResolveExportBlueprintPrototypes(
+                uid,
+                protoId,
+                out var exportedEntityProtoId,
+                out var resolvedConstructionProtoId);
+
+            var constructionProtoId = MapPrototypeToConstructionPrototype(exportedEntityProtoId)
+                                      ?? resolvedConstructionProtoId
+                                      ?? MapPrototypeToConstructionPrototype(protoId);
+            var phase = ClassifyZPhase(uid, exportedEntityProtoId);
             var dir = xform.LocalRotation.GetCardinalDir().ToString();
 
             items.Add(new BlueprintItemEntry
@@ -363,7 +371,7 @@ public sealed class RobustaBlueprintManager : EntitySystem
                 OffsetX = tileX - minX,
                 OffsetY = tileY - minY,
                 Direction = dir,
-                EntityPrototypeId = protoId,
+                EntityPrototypeId = exportedEntityProtoId,
                 ConstructionPrototypeId = constructionProtoId,
                 Phase = phase,
                 LayerOrder = (int)phase

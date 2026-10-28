@@ -3,19 +3,25 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using HarmonyLib;
 using Content.Client.Construction;
 using Content.Shared.Construction;
 using Content.Shared.Construction.Prototypes;
 using Content.Shared.DoAfter;
 using Content.Shared.Hands;
+using Content.Shared.Hands.Components;
 using Content.Shared.Hands.EntitySystems;
+using Content.Shared.Inventory;
+using Content.Shared.Inventory.Events;
 using Content.Shared.Stacks;
+using Content.Shared.Storage;
 using Content.Shared.Tag;
 using Content.Shared.Tools.Systems;
 using Content.Shared.Wires;
 using Robust.Client.Graphics;
 using Robust.Client.Input;
 using Robust.Client.Player;
+using Robust.Shared.Containers;
 using Robust.Shared.GameObjects;
 using Robust.Shared.IoC;
 using Robust.Shared.Log;
@@ -39,6 +45,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     [Dependency] private readonly SharedTransformSystem _transform = default!;
     [Dependency] private readonly SharedMapSystem _mapSystem = default!;
     [Dependency] private readonly SharedHandsSystem _hands = default!;
+    [Dependency] private readonly InventorySystem _inventory = default!;
+    [Dependency] private readonly SharedContainerSystem _container = default!;
     [Dependency] private readonly SharedToolSystem _toolSystem = default!;
     [Dependency] private readonly TagSystem _tagSystem = default!;
     [Dependency] private readonly ItemUtilitySystem _itemUtil = default!;
@@ -49,6 +57,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     private ISawmill _log = default!;
 
     private const float MaxInteractRange = 2.5f;
+    private const float BlueprintBuildInteractRange = 1.55f;
     private const float SettleDelay = 0.25f;
     private const float TargetRescanTimeout = 2.5f;
     private const float DoubleTapOrHoldWindow = 0.25f;
@@ -81,16 +90,18 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     private EntityUid? _stepStartHeldItem;
     private int _stepStartHeldStackCount;
     private int _stepRetryCount;
+    private int _equipRetryCount;
     private int _welderIgniteRetries;
     private bool _sawDoAfterForStep;
     private bool _doAfterCancelledForStep;
     private float _stepWaitElapsed;
     private float _postDoAfterTimer;
     private bool _delegatedWireSolveStarted;
+    private readonly HashSet<EntityUid> _preExistingTileEntities = new();
 
     private readonly List<(EntityUid GridUid, Vector2i Tile, Direction Dir, BlueprintItemEntry Item)> _blueprintQueue = new();
     public IReadOnlyList<(EntityUid GridUid, Vector2i Tile, Direction Dir, BlueprintItemEntry Item)> PendingBlueprintTasks => _blueprintQueue;
-    public BlueprintZPhase? CurrentActiveBlueprintPhase => _blueprintQueue.Count > 0 ? _blueprintQueue.Min(t => t.Item.Phase) : null;
+    public BlueprintZPhase? CurrentActiveBlueprintPhase => _blueprintQueue.Count > 0 ? _blueprintQueue.Min(t => GetEffectiveBlueprintPhase(t.Item)) : null;
     public BlueprintZPhase? ActivePhaseFilter { get; set; }
     public bool AutoBuildPlacedBlueprints { get; set; } = true;
 
@@ -238,10 +249,20 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         _currentTarget = target;
         _targetCoordinates = Transform(target).Coordinates;
         _targetMapCoords = _transform.GetMapCoordinates(target);
+        _preExistingTileEntities.Clear();
+        if (_targetMapCoords.MapId != MapId.Nullspace)
+        {
+            foreach (var uid in _lookup.GetEntitiesInRange(_targetMapCoords, 0.45f, LookupFlags.Uncontained))
+            {
+                if (uid != target && Exists(uid) && !Deleted(uid) && !HasGhostComponent(uid))
+                    _preExistingTileEntities.Add(uid);
+            }
+        }
         _waitTimer = 0f;
         _rescanTimer = 0f;
         _wasInDoAfter = false;
         _stepRetryCount = 0;
+        _equipRetryCount = 0;
         _welderIgniteRetries = 0;
         _sawDoAfterForStep = false;
         _doAfterCancelledForStep = false;
@@ -276,6 +297,12 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             ExtinguishActiveWelderIfNeeded();
         }
 
+        if (Exists(_currentTarget) && HasGhostComponent(_currentTarget))
+        {
+            ClearGhostEntity(_currentTarget);
+        }
+
+        _preExistingTileEntities.Clear();
         _activePlan = null;
         _stepIndex = 0;
         _phase = StepExecutionPhase.PrepareAndEquip;
@@ -288,6 +315,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         _stepStartHeldItem = null;
         _stepStartHeldStackCount = 0;
         _stepRetryCount = 0;
+        _equipRetryCount = 0;
         _welderIgniteRetries = 0;
         _sawDoAfterForStep = false;
         _doAfterCancelledForStep = false;
@@ -329,8 +357,9 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         int rotSteps = BlueprintPlacementHijack.DirectionToSteps(rotation);
 
         var items = blueprint.Items
-            .Where(i => onlyPhase == null || i.Phase == onlyPhase.Value)
-            .OrderBy(i => i.Phase)
+            .Where(i => onlyPhase == null || i.Phase == onlyPhase.Value || GetEffectiveBlueprintPhase(i) == onlyPhase.Value)
+            .OrderBy(i => GetEffectiveBlueprintPhase(i))
+            .ThenBy(i => GetEffectiveBlueprintSubPriority(i))
             .ThenBy(i => i.LayerOrder)
             .ThenBy(i => i.OffsetY)
             .ThenBy(i => i.OffsetX)
@@ -359,7 +388,9 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
         _blueprintQueue.Sort((a, b) =>
         {
-            int c = a.Item.Phase.CompareTo(b.Item.Phase);
+            int c = GetEffectiveBlueprintPhase(a.Item).CompareTo(GetEffectiveBlueprintPhase(b.Item));
+            if (c != 0) return c;
+            c = GetEffectiveBlueprintSubPriority(a.Item).CompareTo(GetEffectiveBlueprintSubPriority(b.Item));
             if (c != 0) return c;
             return a.Item.LayerOrder.CompareTo(b.Item.LayerOrder);
         });
@@ -436,74 +467,112 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
     private void ProcessNextQueuedBlueprintTask(EntityUid player)
     {
+        var playerMapCoords = _transform.GetMapCoordinates(player);
+
         while (_blueprintQueue.Count > 0)
         {
-            var minPhase = _blueprintQueue.Min(t => t.Item.Phase);
-            int idx = _blueprintQueue.FindIndex(t => t.Item.Phase == minPhase);
-            if (idx < 0)
+            // Prune invalid grids or already-built items in the current earliest effective phase
+            var minPhase = _blueprintQueue.Min(t => GetEffectiveBlueprintPhase(t.Item));
+            bool prunedAny = false;
+
+            for (int i = _blueprintQueue.Count - 1; i >= 0; i--)
+            {
+                var candidate = _blueprintQueue[i];
+                if (GetEffectiveBlueprintPhase(candidate.Item) != minPhase)
+                    continue;
+
+                if (!Exists(candidate.GridUid) || !TryComp<MapGridComponent>(candidate.GridUid, out var cGrid))
+                {
+                    _blueprintQueue.RemoveAt(i);
+                    prunedAny = true;
+                    continue;
+                }
+
+                var cCoords = _mapSystem.GridTileToLocal(candidate.GridUid, cGrid, candidate.Tile);
+                var cMap = _transform.ToMapCoordinates(cCoords);
+                if (cMap.MapId != playerMapCoords.MapId ||
+                    IsBlueprintItemAlreadySatisfied(cMap, candidate.Item, candidate.Dir))
+                {
+                    _blueprintQueue.RemoveAt(i);
+                    prunedAny = true;
+                }
+            }
+
+            if (_blueprintQueue.Count == 0)
                 return;
 
-            var task = _blueprintQueue[idx];
-            if (!Exists(task.GridUid) || !TryComp<MapGridComponent>(task.GridUid, out var grid))
+            if (prunedAny)
+                minPhase = _blueprintQueue.Min(t => GetEffectiveBlueprintPhase(t.Item));
+
+            // Determine the earliest sub-priority still queued on each tile so a pipe (SubPriority 2)
+            // is NEVER built on a tile while a filter/mixer/pump/port/vent (SubPriority 1) is still queued on that tile.
+            var minSubPriorityPerTile = new Dictionary<(EntityUid GridUid, Vector2i Tile), int>();
+            foreach (var entry in _blueprintQueue)
             {
-                _blueprintQueue.RemoveAt(idx);
-                continue;
+                if (GetEffectiveBlueprintPhase(entry.Item) != minPhase)
+                    continue;
+
+                var key = (entry.GridUid, entry.Tile);
+                int sub = GetEffectiveBlueprintSubPriority(entry.Item);
+                if (!minSubPriorityPerTile.TryGetValue(key, out int curMin) || sub < curMin)
+                    minSubPriorityPerTile[key] = sub;
             }
 
+            // Pick the best in-range task in minPhase:
+            // 1. Must be at the earliest pending SubPriority for its tile (so contraptions on a tile ALWAYS build before pipes on that tile)
+            // 2. Prefer lower SubPriority (all in-range contraptions before in-range pipes), then nearest distance
+            int bestIdx = -1;
+            int bestSubPriority = int.MaxValue;
+            float bestDist = float.MaxValue;
+            int bestLayerOrder = int.MaxValue;
+
+            for (int i = 0; i < _blueprintQueue.Count; i++)
+            {
+                var candidate = _blueprintQueue[i];
+                if (GetEffectiveBlueprintPhase(candidate.Item) != minPhase ||
+                    !Exists(candidate.GridUid) ||
+                    !TryComp<MapGridComponent>(candidate.GridUid, out var cGrid))
+                    continue;
+
+                int subPriority = GetEffectiveBlueprintSubPriority(candidate.Item);
+                if (minSubPriorityPerTile.TryGetValue((candidate.GridUid, candidate.Tile), out int tileMinSub) &&
+                    subPriority > tileMinSub)
+                {
+                    // Hold off on pipes on this tile until the contraption(s) on this tile are built first
+                    continue;
+                }
+
+                var cCoords = _mapSystem.GridTileToLocal(candidate.GridUid, cGrid, candidate.Tile);
+                var cMap = _transform.ToMapCoordinates(cCoords);
+                if (cMap.MapId != playerMapCoords.MapId)
+                    continue;
+
+                float d = (cMap.Position - playerMapCoords.Position).Length();
+                if (d > BlueprintBuildInteractRange)
+                    continue;
+
+                if (subPriority < bestSubPriority ||
+                    (subPriority == bestSubPriority && d < bestDist - 0.05f) ||
+                    (subPriority == bestSubPriority && MathF.Abs(d - bestDist) <= 0.05f && candidate.Item.LayerOrder < bestLayerOrder))
+                {
+                    bestSubPriority = subPriority;
+                    bestDist = d;
+                    bestLayerOrder = candidate.Item.LayerOrder;
+                    bestIdx = i;
+                }
+            }
+
+            // If no eligible task in this phase is within SS14's construction interaction range,
+            // keep remaining tasks in the queue (and visible on the overlay) until the player steps closer.
+            if (bestIdx < 0)
+                return;
+
+            var task = _blueprintQueue[bestIdx];
+            _blueprintQueue.RemoveAt(bestIdx);
+
+            var grid = Comp<MapGridComponent>(task.GridUid);
             var tileCoords = _mapSystem.GridTileToLocal(task.GridUid, grid, task.Tile);
             var tileMapCoords = _transform.ToMapCoordinates(tileCoords);
-            var playerMapCoords = _transform.GetMapCoordinates(player);
-
-            if (tileMapCoords.MapId != playerMapCoords.MapId)
-            {
-                _blueprintQueue.RemoveAt(idx);
-                continue;
-            }
-
-            // Skip if target structure is already present on this tile
-            if (IsBlueprintItemAlreadySatisfied(tileMapCoords, task.Item))
-            {
-                _blueprintQueue.RemoveAt(idx);
-                continue;
-            }
-
-            // Check if there is a nearer task in the SAME phase within interaction range
-            float distToPlayer = (tileMapCoords.Position - playerMapCoords.Position).Length();
-            if (distToPlayer > MaxInteractRange)
-            {
-                int inRangeIdx = -1;
-                float bestDist = float.MaxValue;
-                for (int i = 0; i < _blueprintQueue.Count; i++)
-                {
-                    var candidate = _blueprintQueue[i];
-                    if (candidate.Item.Phase != minPhase || !Exists(candidate.GridUid) ||
-                        !TryComp<MapGridComponent>(candidate.GridUid, out var cGrid))
-                        continue;
-
-                    var cCoords = _mapSystem.GridTileToLocal(candidate.GridUid, cGrid, candidate.Tile);
-                    var cMap = _transform.ToMapCoordinates(cCoords);
-                    if (cMap.MapId != playerMapCoords.MapId)
-                        continue;
-
-                    float d = (cMap.Position - playerMapCoords.Position).Length();
-                    if (d <= MaxInteractRange && d < bestDist)
-                    {
-                        bestDist = d;
-                        inRangeIdx = i;
-                    }
-                }
-
-                if (inRangeIdx >= 0)
-                {
-                    idx = inRangeIdx;
-                    task = _blueprintQueue[idx];
-                    grid = Comp<MapGridComponent>(task.GridUid);
-                    tileCoords = _mapSystem.GridTileToLocal(task.GridUid, grid, task.Tile);
-                    tileMapCoords = _transform.ToMapCoordinates(tileCoords);
-                }
-            }
-
-            _blueprintQueue.RemoveAt(idx);
 
             // 1. Direct stack placement (Cables, Floor Tiles, Rods/Lattice)
             if (TryExecuteDirectStackBlueprintItem(task.Item, tileCoords))
@@ -512,8 +581,22 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 return;
             }
 
-            // 2. Existing unfinished frame or ghost on the tile
-            var existingFrameOrGhost = FindMatchingFrameOrGhostOnTile(tileMapCoords, task.Item);
+            var recipeId = task.Item.ConstructionPrototypeId;
+            var resolvedFromEntity = _solver.ResolveConstructionPrototypeForEntity(task.Item.EntityPrototypeId);
+            if (string.IsNullOrEmpty(recipeId) || !_protoMan.HasIndex<ConstructionPrototype>(recipeId))
+            {
+                recipeId = resolvedFromEntity;
+            }
+            else if (!string.IsNullOrEmpty(resolvedFromEntity) &&
+                     !string.Equals(recipeId, resolvedFromEntity, StringComparison.OrdinalIgnoreCase) &&
+                     _solver.GetDesiredPipeLayer(task.Item.EntityPrototypeId, null) > 0 &&
+                     RobustaConstructionSolver.GetPipeLayerForIdOrNode(resolvedFromEntity) > 0)
+            {
+                recipeId = resolvedFromEntity;
+            }
+
+            // 2. Existing unfinished frame or matching ghost on the tile (clearing any mismatched ghosts)
+            var existingFrameOrGhost = FindMatchingFrameOrGhostOnTile(tileMapCoords, task.Item, task.Dir, recipeId);
             if (existingFrameOrGhost != null && Exists(existingFrameOrGhost.Value))
             {
                 var existingPlan = _solver.SolveBuildPlan(existingFrameOrGhost.Value, task.Item.EntityPrototypeId);
@@ -524,10 +607,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 }
             }
 
-            // 3. Spawn construction ghost and start auto-building it
-            var recipeId = task.Item.ConstructionPrototypeId;
-            if (string.IsNullOrEmpty(recipeId) || !_protoMan.HasIndex<ConstructionPrototype>(recipeId))
-                recipeId = _solver.ResolveConstructionPrototypeForEntity(task.Item.EntityPrototypeId);
+            // 3. Ensure no leftover ghost is occupying the tile, then spawn this item's construction ghost on-demand
+            ClearGhostsOnTile(tileMapCoords);
 
             if (!string.IsNullOrEmpty(recipeId) &&
                 _protoMan.TryIndex<ConstructionPrototype>(recipeId, out var cProto) &&
@@ -548,10 +629,102 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         }
     }
 
-    private bool IsBlueprintItemAlreadySatisfied(MapCoordinates tileMapCoords, BlueprintItemEntry item)
+    private BlueprintZPhase GetEffectiveBlueprintPhase(BlueprintItemEntry item)
+    {
+        if (IsAtmosPipeContraption(item))
+            return BlueprintZPhase.Phase1_UnderfloorUtilities;
+
+        return item.Phase;
+    }
+
+    private int GetEffectiveBlueprintSubPriority(BlueprintItemEntry item)
+    {
+        var idLower = (item.EntityPrototypeId ?? string.Empty).ToLowerInvariant();
+        if (idLower.Contains("cablehv") || idLower.Contains("cablemv") || idLower.Contains("cableapc"))
+            return 0;
+
+        // Filters, mixers, pumps, connector ports, valves, vents, scrubbers, injectors, and disposal trunks
+        // MUST be built and anchored on the tile BEFORE overlapping pipes (GasPipe / DisposalPipe).
+        if (IsAtmosPipeContraption(item))
+            return 1;
+
+        if (idLower.Contains("gaspipe") || idLower.Contains("disposalpipe"))
+            return 2;
+
+        return 3 + item.LayerOrder;
+    }
+
+    private bool IsAtmosPipeContraption(BlueprintItemEntry item)
+    {
+        var idLower = (item.EntityPrototypeId ?? string.Empty).ToLowerInvariant();
+        var recipeLower = (item.ConstructionPrototypeId ?? string.Empty).ToLowerInvariant();
+
+        if (idLower.Contains("gaspipe") || idLower.Contains("disposalpipe"))
+            return false;
+
+        string[] contraptionKeywords =
+        {
+            "gasfilter",
+            "gasmixer",
+            "gasport",
+            "connectorport",
+            "volumepump",
+            "pressurepump",
+            "passivegate",
+            "gasvalve",
+            "signalvalve",
+            "pneumaticvalve",
+            "passivevent",
+            "ventpump",
+            "ventscrubber",
+            "outletinjector",
+            "thermomachine",
+            "heatexchanger",
+            "gasradiator",
+            "gasrecycler",
+            "canisterport",
+            "gastagger",
+            "disposaltrunk",
+            "disposalrouter",
+            "disposaljunction",
+            "disposaltagger"
+        };
+
+        foreach (var kw in contraptionKeywords)
+        {
+            if (idLower.Contains(kw, StringComparison.Ordinal) ||
+                recipeLower.Contains(kw, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        var recipeId = item.ConstructionPrototypeId;
+        if (string.IsNullOrEmpty(recipeId) || !_protoMan.HasIndex<ConstructionPrototype>(recipeId))
+            recipeId = _solver.ResolveConstructionPrototypeForEntity(item.EntityPrototypeId);
+
+        if (!string.IsNullOrEmpty(recipeId) &&
+            _protoMan.TryIndex<ConstructionPrototype>(recipeId, out var cProto))
+        {
+            var graphId = GetStringMember(cProto, "Graph") ?? string.Empty;
+            if (graphId.Equals("GasBinary", StringComparison.OrdinalIgnoreCase) ||
+                graphId.Equals("GasTrinary", StringComparison.OrdinalIgnoreCase) ||
+                graphId.Equals("GasUnary", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool IsBlueprintItemAlreadySatisfied(MapCoordinates tileMapCoords, BlueprintItemEntry item, Direction expectedDir)
     {
         if (string.IsNullOrEmpty(item.EntityPrototypeId))
             return false;
+
+        var desiredBaseId = _solver.NormalizeBaseEntityPrototypeId(item.EntityPrototypeId);
+        int desiredLayer = _solver.GetDesiredPipeLayer(item.EntityPrototypeId, item.ConstructionPrototypeId);
 
         var entities = _lookup.GetEntitiesInRange(tileMapCoords, 0.35f, LookupFlags.Uncontained);
         foreach (var uid in entities)
@@ -560,58 +733,156 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 continue;
 
             var protoId = MetaData(uid).EntityPrototype?.ID;
-            if (string.Equals(protoId, item.EntityPrototypeId, StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrEmpty(protoId))
+                continue;
+
+            var entBaseId = _solver.NormalizeBaseEntityPrototypeId(protoId);
+            if (!string.Equals(protoId, item.EntityPrototypeId, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(entBaseId, desiredBaseId, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var xform = Transform(uid);
+            if (!xform.Anchored)
+                continue;
+
+            if (xform.LocalRotation.GetCardinalDir() != expectedDir)
+                continue;
+
+            int actualLayer = _solver.DetectEntityPipeLayer(uid, out _);
+            if (actualLayer == desiredLayer)
                 return true;
         }
 
         return false;
     }
 
-    private EntityUid? FindMatchingFrameOrGhostOnTile(MapCoordinates tileMapCoords, BlueprintItemEntry item)
+    private EntityUid? FindMatchingFrameOrGhostOnTile(
+        MapCoordinates tileMapCoords,
+        BlueprintItemEntry item,
+        Direction expectedDir,
+        string? expectedRecipeId)
     {
-        var entities = _lookup.GetEntitiesInRange(tileMapCoords, 0.35f, LookupFlags.Uncontained);
+        var entities = _lookup.GetEntitiesInRange(tileMapCoords, 0.35f, LookupFlags.Uncontained).ToList();
+        EntityUid? matchedGhost = null;
+
         foreach (var uid in entities)
         {
             if (!Exists(uid) || Deleted(uid))
                 continue;
 
             if (HasGhostComponent(uid))
-                return uid;
+            {
+                var ghostComp = FindComponentByName(uid, "ConstructionGhostComponent");
+                var ghostProto = GetMemberValue(ghostComp, "Prototype") as ConstructionPrototype;
+                var ghostProtoId = ghostProto?.ID ?? GetStringMember(ghostComp, "Prototype");
+                var ghostDir = Transform(uid).LocalRotation.GetCardinalDir();
 
-            if (IsGhostOrUnfinishedFrame(uid) && _solver.TryResolveGraphAndNode(uid, out _, out _, out _))
+                if (!string.IsNullOrEmpty(expectedRecipeId) &&
+                    string.Equals(ghostProtoId, expectedRecipeId, StringComparison.OrdinalIgnoreCase) &&
+                    ghostDir == expectedDir &&
+                    matchedGhost == null)
+                {
+                    matchedGhost = uid;
+                }
+                else
+                {
+                    // Clear mismatched ghost so it doesn't block multi-layer placement on this tile
+                    ClearGhostEntity(uid);
+                }
+                continue;
+            }
+
+            if (IsGhostOrUnfinishedFrame(uid) &&
+                _solver.TryResolveGraphAndNode(uid, out var frameGraph, out _, out _) &&
+                frameGraph != null)
+            {
+                if (!string.IsNullOrEmpty(expectedRecipeId) &&
+                    _protoMan.TryIndex<ConstructionPrototype>(expectedRecipeId, out var cProto))
+                {
+                    var expectedGraphId = GetStringMember(cProto, "Graph");
+                    if (!string.Equals(frameGraph.ID, expectedGraphId, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                }
                 return uid;
+            }
         }
 
-        return null;
+        return matchedGhost;
+    }
+
+    private void ClearGhostsOnTile(MapCoordinates tileMapCoords)
+    {
+        var entities = _lookup.GetEntitiesInRange(tileMapCoords, 0.35f, LookupFlags.Uncontained).ToList();
+        foreach (var uid in entities)
+        {
+            if (Exists(uid) && HasGhostComponent(uid))
+                ClearGhostEntity(uid);
+        }
+    }
+
+    private void ClearGhostEntity(EntityUid ghostUid)
+    {
+        if (!Exists(ghostUid) || !HasGhostComponent(ghostUid))
+            return;
+
+        try
+        {
+            var ghostComp = FindComponentByName(ghostUid, "ConstructionGhostComponent");
+            int ghostId = ghostComp != null && GetMemberValue(ghostComp, "GhostId") is int gid
+                ? gid
+                : ghostUid.GetHashCode();
+            _clientConstruction.ClearGhost(ghostId);
+        }
+        catch
+        {
+            // Ignore if ClearGhost fails
+        }
+
+        if (Exists(ghostUid) && IsClientSide(ghostUid))
+        {
+            EntityManager.QueueDeleteEntity(ghostUid);
+        }
     }
 
     private bool TryExecuteDirectStackBlueprintItem(BlueprintItemEntry item, EntityCoordinates tileCoords)
     {
         var idLower = (item.EntityPrototypeId ?? string.Empty).ToLowerInvariant();
         string? stackProtoOrType = null;
+        string? matId = null;
 
         if (idLower.Contains("cablehv"))
+        {
             stackProtoOrType = "CableHVStack";
+            matId = "CableHV";
+        }
         else if (idLower.Contains("cablemv"))
+        {
             stackProtoOrType = "CableMVStack";
+            matId = "CableMV";
+        }
         else if (idLower.Contains("cableapc"))
+        {
             stackProtoOrType = "CableApcExtensionStack";
+            matId = "Cable";
+        }
         else if (idLower.Contains("floortile") || idLower == "tileitemsteel")
+        {
             stackProtoOrType = "FloorTileItemSteel";
+            matId = "FloorTile";
+        }
 
-        if (string.IsNullOrEmpty(stackProtoOrType))
+        if (string.IsNullOrEmpty(stackProtoOrType) || string.IsNullOrEmpty(matId))
             return false;
 
         bool equipped = _itemUtil.TryEquipItem(stackProtoOrType, 1) ||
                         _itemUtil.TryEquipByPredicate(
-                            uid => TryComp<StackComponent>(uid, out var st) &&
-                                   st.StackTypeId.Id.Contains(
-                                       idLower.Contains("cablehv") ? "CableHV" :
-                                       idLower.Contains("cablemv") ? "CableMV" :
-                                       idLower.Contains("cableapc") ? "Cable" : "FloorTile",
-                                       StringComparison.OrdinalIgnoreCase),
+                            uid => MatchesMaterialOrStack(uid, matId),
                             $"DirectStack:{stackProtoOrType}",
-                            1);
+                            1) ||
+                        (_player.LocalEntity is { } player &&
+                         TryEquipFromDeepInventoryOrVicinity(player, uid => MatchesMaterialOrStack(uid, matId), 1));
 
         if (!equipped)
             return false;
@@ -642,6 +913,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 _targetMapCoords = _transform.GetMapCoordinates(replacement);
                 _rescanTimer = 0f;
                 _stepRetryCount = 0;
+        _equipRetryCount = 0;
 
                 if (_phase == StepExecutionPhase.WaitForCompletion)
                 {
@@ -750,16 +1022,35 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             }
         }
 
+        // Skip redundant pipe-layer screwdriver step if entity is already on that pipe layer
+        if (TryGetStepTargetPipeLayer(step, out int desiredStepLayer) &&
+            Exists(_currentTarget) &&
+            _solver.DetectEntityPipeLayer(_currentTarget, out _) == desiredStepLayer)
+        {
+            _stepIndex++;
+            _phase = StepExecutionPhase.PrepareAndEquip;
+            return;
+        }
+
         switch (_phase)
         {
             case StepExecutionPhase.PrepareAndEquip:
             {
                 if (!PrepareAndEquipForStep(player, step))
                 {
+                    if (_equipRetryCount == 0 && TryOpenWornStorageSlots(player))
+                    {
+                        _equipRetryCount = 1;
+                        _waitTimer = 0.35f;
+                        return;
+                    }
+
                     _log.Warning($"Failed to equip required item for step [{_stepIndex + 1}/{_activePlan.Steps.Count}]: {step.Description}");
                     FinishCurrentPlan();
                     return;
                 }
+
+                _equipRetryCount = 0;
 
                 if (step.Kind == ConstructionActionKind.UseTool &&
                     string.Equals(step.PrototypeOrQualityOrTag, "Welding", StringComparison.OrdinalIgnoreCase))
@@ -869,13 +1160,25 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         _targetMapCoords = _transform.GetMapCoordinates(spawnedStructure);
                         _rescanTimer = 0f;
                         _stepRetryCount = 0;
+        _equipRetryCount = 0;
                         AdvancePastGhostStartSteps();
                         _phase = StepExecutionPhase.PrepareAndEquip;
                         return;
                     }
 
                     _rescanTimer += frameTime;
-                    if (_rescanTimer >= TargetRescanTimeout)
+                    if (!_sawDoAfterForStep && _rescanTimer >= 0.75f)
+                    {
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        if (_stepRetryCount <= 3)
+                        {
+                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            return;
+                        }
+                    }
+
+                    if (_rescanTimer >= TargetRescanTimeout || _stepRetryCount > 3)
                     {
                         _log.Warning("Timed out waiting for construction ghost to spawn structure.");
                         FinishCurrentPlan();
@@ -928,6 +1231,24 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                             _wiresSolver.IsDoorWelded(_currentTarget))
                         {
                             stepAlreadyProgressed = true;
+                        }
+
+                        if (!stepAlreadyProgressed &&
+                            TryGetStepTargetPipeLayer(step, out int checkPipeLayer))
+                        {
+                            if (Exists(_currentTarget) &&
+                                _solver.DetectEntityPipeLayer(_currentTarget, out _) == checkPipeLayer)
+                            {
+                                stepAlreadyProgressed = true;
+                            }
+                            else if (TryRelocateReplacementEntity(_stepStartTarget, out var repPipeEnt) &&
+                                     _solver.DetectEntityPipeLayer(repPipeEnt, out _) == checkPipeLayer)
+                            {
+                                _currentTarget = repPipeEnt;
+                                _targetCoordinates = Transform(repPipeEnt).Coordinates;
+                                _targetMapCoords = _transform.GetMapCoordinates(repPipeEnt);
+                                stepAlreadyProgressed = true;
+                            }
                         }
 
                         if (!stepAlreadyProgressed &&
@@ -1082,6 +1403,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                             {
                                 _stepIndex++;
                                 _stepRetryCount = 0;
+        _equipRetryCount = 0;
                                 _phase = StepExecutionPhase.PrepareAndEquip;
                                 return;
                             }
@@ -1107,6 +1429,28 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         _rescanTimer += frameTime;
                         if (_rescanTimer >= 0.7f)
                         {
+                            // If anchoring on Primary failed and the next step(s) adjust pipe layer via Screwdriver,
+                            // swap the pipe-layer Screwdriver step(s) before Anchor frame so it switches layer while unanchored first.
+                            if (wantsAnchor && !isAnchored &&
+                                _stepIndex + 1 < _activePlan.Steps.Count &&
+                                TryGetStepTargetPipeLayer(_activePlan.Steps[_stepIndex + 1], out _))
+                            {
+                                var anchorStep = _activePlan.Steps[_stepIndex];
+                                int insertIdx = _stepIndex;
+                                while (insertIdx + 1 < _activePlan.Steps.Count &&
+                                       TryGetStepTargetPipeLayer(_activePlan.Steps[insertIdx + 1], out _))
+                                {
+                                    _activePlan.Steps[insertIdx] = _activePlan.Steps[insertIdx + 1];
+                                    insertIdx++;
+                                }
+                                _activePlan.Steps[insertIdx] = anchorStep;
+                                _rescanTimer = 0f;
+                                _stepRetryCount = 0;
+        _equipRetryCount = 0;
+                                _phase = StepExecutionPhase.PrepareAndEquip;
+                                return;
+                            }
+
                             _rescanTimer = 0f;
                             _stepRetryCount++;
                             if (_stepRetryCount <= 3)
@@ -1119,6 +1463,49 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                             FinishCurrentPlan();
                         }
                         return;
+                    }
+                }
+
+                // Verify pipe-layer Screwdriver transitions (both in-place and entity-replacement)
+                if (TryGetStepTargetPipeLayer(step, out int verifyPipeLayer))
+                {
+                    if ((!Exists(_currentTarget) || Deleted(_currentTarget)) &&
+                        TryRelocateTargetEntity(out var relocatedPipeEnt))
+                    {
+                        _currentTarget = relocatedPipeEnt;
+                        _targetCoordinates = Transform(relocatedPipeEnt).Coordinates;
+                        _targetMapCoords = _transform.GetMapCoordinates(relocatedPipeEnt);
+                    }
+                    else if (Exists(_currentTarget) &&
+                             _currentTarget == _stepStartTarget &&
+                             _solver.DetectEntityPipeLayer(_currentTarget, out _) != verifyPipeLayer &&
+                             TryRelocateReplacementEntity(_stepStartTarget, out var replacedPipeEnt))
+                    {
+                        _currentTarget = replacedPipeEnt;
+                        _targetCoordinates = Transform(replacedPipeEnt).Coordinates;
+                        _targetMapCoords = _transform.GetMapCoordinates(replacedPipeEnt);
+                    }
+
+                    if (Exists(_currentTarget) &&
+                        _solver.DetectEntityPipeLayer(_currentTarget, out _) != verifyPipeLayer)
+                    {
+                        _rescanTimer += frameTime;
+                        if (_rescanTimer >= 0.65f)
+                        {
+                            _rescanTimer = 0f;
+                            _stepRetryCount++;
+                            if (_stepRetryCount <= 3)
+                            {
+                                _phase = StepExecutionPhase.PrepareAndEquip;
+                                return;
+                            }
+
+                            _log.Warning($"Step '{step.Description}' did not change pipe layer after retries; advancing.");
+                        }
+                        else
+                        {
+                            return;
+                        }
                     }
                 }
 
@@ -1145,6 +1532,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         _stepIndex++;
                         _rescanTimer = 0f;
                         _stepRetryCount = 0;
+        _equipRetryCount = 0;
                         _phase = StepExecutionPhase.PrepareAndEquip;
                         return;
                     }
@@ -1198,6 +1586,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 _stepIndex++;
                 _rescanTimer = 0f;
                 _stepRetryCount = 0;
+        _equipRetryCount = 0;
                 _phase = StepExecutionPhase.PrepareAndEquip;
                 break;
             }
@@ -1288,6 +1677,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 _stepIndex++;
             _rescanTimer = 0f;
             _stepRetryCount = 0;
+        _equipRetryCount = 0;
             _phase = StepExecutionPhase.PrepareAndEquip;
             _waitTimer = SettleDelay;
             return;
@@ -1323,22 +1713,28 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 if (string.IsNullOrEmpty(matId))
                     return false;
 
-                // Try equipping by StackTypeId or prototype ID
-                if (_itemUtil.TryEquipItem(new ProtoId<StackPrototype>(matId), step.Amount))
-                    return true;
-
+                // 1. Unified material/stack matcher (handles StackTypeId, prototype Stack, StackPrototype.Spawn, CableCoil/LV/MV/HV cables, etc.)
                 if (_itemUtil.TryEquipByPredicate(
-                        uid => TryComp<StackComponent>(uid, out var stack) &&
-                               string.Equals(stack.StackTypeId, matId, StringComparison.OrdinalIgnoreCase),
+                        uid => MatchesMaterialOrStack(uid, matId),
                         $"Material:{matId}",
                         step.Amount))
                 {
                     return true;
                 }
 
-                return _itemUtil.TryEquipByPredicate(
-                    uid => MatchesMachinePart(uid, matId),
-                    $"MaterialOrPart:{matId}",
+                // 2. MachinePart / StockPart fallback
+                if (_itemUtil.TryEquipByPredicate(
+                        uid => MatchesMachinePart(uid, matId),
+                        $"MaterialOrPart:{matId}",
+                        step.Amount))
+                {
+                    return true;
+                }
+
+                // 3. Deep container (e.g. toolbox/box inside backpack, secondary containers) & 2.5m vicinity fallback
+                return TryEquipFromDeepInventoryOrVicinity(
+                    player,
+                    uid => MatchesMaterialOrStack(uid, matId) || MatchesMachinePart(uid, matId),
                     step.Amount);
             }
 
@@ -1349,9 +1745,17 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 if (string.IsNullOrEmpty(quality))
                     return false;
 
-                return _itemUtil.TryEquipByPredicate(
+                if (_itemUtil.TryEquipByPredicate(
+                        uid => _toolSystem.HasQuality(uid, quality),
+                        $"Tool:{quality}"))
+                {
+                    return true;
+                }
+
+                return TryEquipFromDeepInventoryOrVicinity(
+                    player,
                     uid => _toolSystem.HasQuality(uid, quality),
-                    $"Tool:{quality}");
+                    1);
             }
 
             case ConstructionActionKind.InsertPrototype:
@@ -1360,7 +1764,21 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 if (string.IsNullOrEmpty(protoId))
                     return false;
 
-                return _itemUtil.TryEquipItem(new EntProtoId(protoId), step.Amount);
+                if (_itemUtil.TryEquipItem(new EntProtoId(protoId), step.Amount, includeChildren: true))
+                    return true;
+
+                if (_itemUtil.TryEquipByPredicate(
+                        uid => MatchesPrototypeOrParentId(uid, protoId, allowPrefixMatch: false) || HasValidTag(uid, protoId),
+                        $"Prototype:{protoId}",
+                        step.Amount))
+                {
+                    return true;
+                }
+
+                return TryEquipFromDeepInventoryOrVicinity(
+                    player,
+                    uid => MatchesPrototypeOrParentId(uid, protoId, allowPrefixMatch: false) || HasValidTag(uid, protoId),
+                    step.Amount);
             }
 
             case ConstructionActionKind.InsertComponent:
@@ -1372,38 +1790,55 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 if (string.Equals(compName, "MachineBoard", StringComparison.OrdinalIgnoreCase))
                 {
                     return _itemUtil.TryEquipByPredicate(
-                        uid => _solver.IsMachineBoardEntity(uid),
-                        "Component:MachineBoard",
-                        step.Amount);
+                               uid => _solver.IsMachineBoardEntity(uid),
+                               "Component:MachineBoard",
+                               step.Amount) ||
+                           TryEquipFromDeepInventoryOrVicinity(
+                               player,
+                               uid => _solver.IsMachineBoardEntity(uid),
+                               step.Amount);
                 }
 
                 if (compName.StartsWith("MachinePart:", StringComparison.OrdinalIgnoreCase))
                 {
                     var partId = compName["MachinePart:".Length..];
                     return _itemUtil.TryEquipByPredicate(
-                        uid => MatchesMachinePart(uid, partId),
-                        $"MachinePart:{partId}",
-                        step.Amount);
+                               uid => MatchesMachinePart(uid, partId),
+                               $"MachinePart:{partId}",
+                               step.Amount) ||
+                           TryEquipFromDeepInventoryOrVicinity(
+                               player,
+                               uid => MatchesMachinePart(uid, partId),
+                               step.Amount);
+                }
+
+                bool MatchesComponentRequirement(EntityUid uid)
+                {
+                    if (!Exists(uid))
+                        return false;
+
+                    if (EntityManager.GetComponents(uid).Any(c =>
+                            c.GetType().Name.Equals(compName, StringComparison.OrdinalIgnoreCase) ||
+                            c.GetType().Name.Equals(compName + "Component", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        return true;
+                    }
+
+                    var proto = MetaData(uid).EntityPrototype;
+                    if (proto != null && _itemUtil.HasPrototypeComponent(proto, compName))
+                        return true;
+
+                    return MatchesTagOrPrototype(uid, compName);
                 }
 
                 return _itemUtil.TryEquipByPredicate(
-                    uid =>
-                    {
-                        if (EntityManager.GetComponents(uid).Any(c =>
-                                c.GetType().Name.Equals(compName, StringComparison.OrdinalIgnoreCase) ||
-                                c.GetType().Name.Equals(compName + "Component", StringComparison.OrdinalIgnoreCase)))
-                        {
-                            return true;
-                        }
-
-                        var proto = MetaData(uid).EntityPrototype;
-                        if (proto != null && _itemUtil.HasPrototypeComponent(proto, compName))
-                            return true;
-
-                        return _tagSystem.HasTag(uid, compName);
-                    },
-                    $"Component:{compName}",
-                    step.Amount);
+                           MatchesComponentRequirement,
+                           $"Component:{compName}",
+                           step.Amount) ||
+                       TryEquipFromDeepInventoryOrVicinity(
+                           player,
+                           MatchesComponentRequirement,
+                           step.Amount);
             }
 
             case ConstructionActionKind.InsertTag:
@@ -1413,13 +1848,540 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     return false;
 
                 return _itemUtil.TryEquipByPredicate(
-                    uid => _tagSystem.HasTag(uid, tag),
-                    $"Tag:{tag}",
-                    step.Amount);
+                           uid => MatchesTagOrPrototype(uid, tag),
+                           $"Tag:{tag}",
+                           step.Amount) ||
+                       TryEquipFromDeepInventoryOrVicinity(
+                           player,
+                           uid => MatchesTagOrPrototype(uid, tag),
+                           step.Amount);
             }
 
             default:
                 return false;
+        }
+    }
+
+    private bool HasValidTag(EntityUid uid, string? tag)
+    {
+        if (!Exists(uid) || string.IsNullOrWhiteSpace(tag))
+            return false;
+
+        try
+        {
+            if (!_protoMan.HasIndex<TagPrototype>(tag))
+                return false;
+
+            return _tagSystem.HasTag(uid, tag);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool MatchesTagOrPrototype(EntityUid uid, string tag)
+    {
+        if (!Exists(uid) || string.IsNullOrWhiteSpace(tag))
+            return false;
+
+        if (HasValidTag(uid, tag))
+            return true;
+
+        if (MatchesPrototypeOrParentId(uid, tag, allowPrefixMatch: false))
+            return true;
+
+        if (EntityManager.GetComponents(uid).Any(c =>
+                c.GetType().Name.Equals(tag, StringComparison.OrdinalIgnoreCase) ||
+                c.GetType().Name.Equals(tag + "Component", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        var proto = MetaData(uid).EntityPrototype;
+        if (proto != null && _itemUtil.HasPrototypeComponent(proto, tag))
+            return true;
+
+        return false;
+    }
+
+    private bool MatchesMaterialOrStack(EntityUid uid, string matId)
+    {
+        if (!Exists(uid) || string.IsNullOrWhiteSpace(matId))
+            return false;
+
+        string? liveStackType = null;
+        if (TryComp<StackComponent>(uid, out var stack))
+        {
+            liveStackType = stack.StackTypeId.Id;
+            if (string.IsNullOrEmpty(liveStackType))
+                liveStackType = GetStringMember(stack, "StackTypeId") ?? GetStringMember(stack, "StackType");
+        }
+
+        if (string.IsNullOrEmpty(liveStackType) && FindComponentByName(uid, "StackComponent") is { } rawStack)
+        {
+            liveStackType = GetStringMember(rawStack, "StackTypeId") ?? GetStringMember(rawStack, "StackType");
+        }
+
+        if (!string.IsNullOrEmpty(liveStackType) &&
+            string.Equals(liveStackType, matId, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (TryGetPrototypeStackType(uid, out var protoStackType))
+        {
+            if (string.Equals(protoStackType, matId, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (string.IsNullOrEmpty(liveStackType))
+                liveStackType = protoStackType;
+        }
+
+        // Check if StackPrototype's Spawn entity prototype matches this entity or its parent prototypes
+        if (_protoMan.TryIndex<StackPrototype>(matId, out var stackProto))
+        {
+            var spawnProtoId = GetStringMember(stackProto, "Spawn");
+            if (!string.IsNullOrEmpty(spawnProtoId) &&
+                MatchesPrototypeOrParentId(uid, spawnProtoId, allowPrefixMatch: true))
+            {
+                return true;
+            }
+        }
+
+        // Handle LV / MV / HV Cable family matching
+        bool wantsLvCable = string.Equals(matId, "Cable", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(matId, "CableLV", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(matId, "CableApc", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(matId, "CableApcExtension", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(matId, "CableCoil", StringComparison.OrdinalIgnoreCase);
+
+        if (wantsLvCable)
+        {
+            // Exclude MV/HV cables and non-coil items like cable cuffs, terminals, zipties, bolas
+            if (!string.IsNullOrEmpty(liveStackType) &&
+                (liveStackType.Contains("MV", StringComparison.OrdinalIgnoreCase) ||
+                 liveStackType.Contains("HV", StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            if (MatchesPrototypeOrParentSubstring(uid, "CableMV") ||
+                MatchesPrototypeOrParentSubstring(uid, "CableHV") ||
+                MatchesPrototypeOrParentSubstring(uid, "CableTerminal") ||
+                MatchesPrototypeOrParentSubstring(uid, "Cuffs") ||
+                MatchesPrototypeOrParentSubstring(uid, "Restraint") ||
+                MatchesPrototypeOrParentSubstring(uid, "Ziptie") ||
+                MatchesPrototypeOrParentSubstring(uid, "Bola"))
+            {
+                return false;
+            }
+
+            if (HasValidTag(uid, "CableCoil") ||
+                HasValidTag(uid, "Cable") ||
+                HasValidTag(uid, "CableLV") ||
+                HasValidTag(uid, "CableApc"))
+            {
+                return true;
+            }
+
+            if (!string.IsNullOrEmpty(liveStackType) &&
+                (liveStackType.Contains("Cable", StringComparison.OrdinalIgnoreCase) ||
+                 liveStackType.Contains("Apc", StringComparison.OrdinalIgnoreCase) ||
+                 liveStackType.Contains("LV", StringComparison.OrdinalIgnoreCase) ||
+                 liveStackType.Contains("Wire", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            if (MatchesPrototypeOrParentSubstring(uid, "CableApc") ||
+                MatchesPrototypeOrParentSubstring(uid, "CableLV") ||
+                MatchesPrototypeOrParentSubstring(uid, "CableStack"))
+            {
+                return true;
+            }
+
+            if (FindComponentByName(uid, "CablePlacerComponent") is { } cablePlacer)
+            {
+                var cableProto = GetStringMember(cablePlacer, "CablePrototypeId")
+                                 ?? GetStringMember(cablePlacer, "CablePrototypeID")
+                                 ?? GetStringMember(cablePlacer, "Cable")
+                                 ?? string.Empty;
+                if (!cableProto.Contains("MV", StringComparison.OrdinalIgnoreCase) &&
+                    !cableProto.Contains("HV", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            var proto = MetaData(uid).EntityPrototype;
+            if (proto != null &&
+                _itemUtil.TryGetPrototypeComponent<object>(proto, "CablePlacer", out var protoPlacer) &&
+                protoPlacer != null)
+            {
+                var cableProto = GetStringMember(protoPlacer, "CablePrototypeId")
+                                 ?? GetStringMember(protoPlacer, "CablePrototypeID")
+                                 ?? GetStringMember(protoPlacer, "Cable")
+                                 ?? string.Empty;
+                if (!cableProto.Contains("MV", StringComparison.OrdinalIgnoreCase) &&
+                    !cableProto.Contains("HV", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+        }
+        else if (string.Equals(matId, "CableMV", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(matId, "CableMVStack", StringComparison.OrdinalIgnoreCase))
+        {
+            if ((!string.IsNullOrEmpty(liveStackType) && liveStackType.Contains("CableMV", StringComparison.OrdinalIgnoreCase)) ||
+                MatchesPrototypeOrParentSubstring(uid, "CableMV"))
+            {
+                return true;
+            }
+        }
+        else if (string.Equals(matId, "CableHV", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(matId, "CableHVStack", StringComparison.OrdinalIgnoreCase))
+        {
+            if ((!string.IsNullOrEmpty(liveStackType) && liveStackType.Contains("CableHV", StringComparison.OrdinalIgnoreCase)) ||
+                MatchesPrototypeOrParentSubstring(uid, "CableHV"))
+            {
+                return true;
+            }
+        }
+
+        // General sheet/stack prototype naming conventions (e.g. SheetSteel, SheetGlass, MaterialPlasteel)
+        if (HasComp<StackComponent>(uid) || !string.IsNullOrEmpty(liveStackType))
+        {
+            if (MatchesPrototypeOrParentId(uid, matId, allowPrefixMatch: true) ||
+                MatchesPrototypeOrParentId(uid, $"Sheet{matId}", allowPrefixMatch: true) ||
+                MatchesPrototypeOrParentId(uid, $"Material{matId}", allowPrefixMatch: true) ||
+                MatchesPrototypeOrParentId(uid, $"{matId}Stack", allowPrefixMatch: true) ||
+                MatchesPrototypeOrParentId(uid, $"Part{matId}", allowPrefixMatch: true))
+            {
+                return true;
+            }
+        }
+
+        return HasValidTag(uid, matId);
+    }
+
+    private bool TryGetPrototypeStackType(EntityUid uid, out string stackType)
+    {
+        stackType = string.Empty;
+        var proto = MetaData(uid).EntityPrototype;
+        if (proto == null)
+            return false;
+
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var queue = new Queue<EntityPrototype>();
+        queue.Enqueue(proto);
+        visited.Add(proto.ID);
+
+        while (queue.Count > 0)
+        {
+            var cur = queue.Dequeue();
+            if (_itemUtil.TryGetPrototypeComponent<object>(cur, "Stack", out var stackComp) && stackComp != null)
+            {
+                var st = GetStringMember(stackComp, "StackTypeId") ?? GetStringMember(stackComp, "StackType");
+                if (!string.IsNullOrEmpty(st))
+                {
+                    stackType = st;
+                    return true;
+                }
+            }
+
+            if (cur.Parents != null)
+            {
+                foreach (var parentId in cur.Parents)
+                {
+                    if (visited.Add(parentId) && _protoMan.TryIndex<EntityPrototype>(parentId, out var parentProto))
+                        queue.Enqueue(parentProto);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool MatchesPrototypeOrParentId(EntityUid uid, string targetProtoId, bool allowPrefixMatch)
+    {
+        if (!Exists(uid) || string.IsNullOrEmpty(targetProtoId))
+            return false;
+
+        var proto = MetaData(uid).EntityPrototype;
+        if (proto == null)
+            return false;
+
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var queue = new Queue<EntityPrototype>();
+        queue.Enqueue(proto);
+        visited.Add(proto.ID);
+
+        while (queue.Count > 0)
+        {
+            var cur = queue.Dequeue();
+            if (string.Equals(cur.ID, targetProtoId, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (allowPrefixMatch &&
+                (cur.ID.StartsWith(targetProtoId, StringComparison.OrdinalIgnoreCase) ||
+                 targetProtoId.StartsWith(cur.ID, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            if (cur.Parents != null)
+            {
+                foreach (var parentId in cur.Parents)
+                {
+                    if (string.Equals(parentId, targetProtoId, StringComparison.OrdinalIgnoreCase))
+                        return true;
+
+                    if (visited.Add(parentId) && _protoMan.TryIndex<EntityPrototype>(parentId, out var parentProto))
+                        queue.Enqueue(parentProto);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool MatchesPrototypeOrParentSubstring(EntityUid uid, string substring)
+    {
+        if (!Exists(uid) || string.IsNullOrEmpty(substring))
+            return false;
+
+        var proto = MetaData(uid).EntityPrototype;
+        if (proto == null)
+            return false;
+
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var queue = new Queue<EntityPrototype>();
+        queue.Enqueue(proto);
+        visited.Add(proto.ID);
+
+        while (queue.Count > 0)
+        {
+            var cur = queue.Dequeue();
+            if (cur.ID.Contains(substring, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (cur.Parents != null)
+            {
+                foreach (var parentId in cur.Parents)
+                {
+                    if (parentId.Contains(substring, StringComparison.OrdinalIgnoreCase))
+                        return true;
+
+                    if (visited.Add(parentId) && _protoMan.TryIndex<EntityPrototype>(parentId, out var parentProto))
+                        queue.Enqueue(parentProto);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryOpenWornStorageSlots(EntityUid player)
+    {
+        if (!Exists(player))
+            return false;
+
+        bool openedAny = false;
+        string[] storageSlots = { "belt", "back", "suitstorage", "outerClothing", "pocket1", "pocket2" };
+        foreach (var slotName in storageSlots)
+        {
+            if (_inventory.TryGetSlotEntity(player, slotName, out var slotEnt) &&
+                slotEnt.HasValue &&
+                Exists(slotEnt.Value) &&
+                HasComp<StorageComponent>(slotEnt.Value))
+            {
+                RaisePredictiveEvent(new OpenSlotStorageNetworkMessage(slotName));
+                openedAny = true;
+            }
+        }
+
+        return openedAny;
+    }
+
+    private bool TryEquipFromDeepInventoryOrVicinity(
+        EntityUid player,
+        Func<EntityUid, bool> predicate,
+        int neededAmount)
+    {
+        if (!Exists(player) || !TryComp<HandsComponent>(player, out var hands))
+            return false;
+
+        int needed = Math.Max(1, neededAmount);
+
+        // 1. Check up to MaxInteractRange (2.5m) via ItemUtilitySystem's vicinity search
+        var vicinityMatches = _itemUtil.FindItemsByPredicate(predicate, needed, MaxInteractRange);
+        int vicinityTotal = vicinityMatches.Sum(m => m.StackCount);
+        if (vicinityMatches.Count > 0 && vicinityTotal >= needed)
+        {
+            var best = vicinityMatches[0];
+            _itemUtil.StowActiveTrackedItem();
+            if (best.Source == ItemSource.Storage && best.StorageEntity is { } storageUid)
+            {
+                if (!string.IsNullOrEmpty(best.SlotOrHand))
+                {
+                    var slotName = best.SlotOrHand;
+                    _itemUtil.EnqueueStep(ItemUtilitySystem.StepDelay, () => RaisePredictiveEvent(new OpenSlotStorageNetworkMessage(slotName)));
+                }
+                var itemUid = best.Entity;
+                _itemUtil.EnqueueStep(ItemUtilitySystem.StepDelay, () =>
+                {
+                    if (!Exists(itemUid) || !Exists(storageUid))
+                        return;
+                    EnsureEmptyActiveHandImmediate(player);
+                    RaisePredictiveEvent(new StorageInteractWithItemEvent(GetNetEntity(itemUid), GetNetEntity(storageUid)));
+                });
+                return true;
+            }
+
+            if (best.Source == ItemSource.Vicinity)
+            {
+                _itemUtil.EnqueueClickEntity(best.Entity);
+                return true;
+            }
+        }
+
+        // 2. Deep scan nested storage containers (e.g. toolbox/box inside backpack, secondary containers on worn items, or open containers nearby)
+        var deepCandidates = new List<(EntityUid Item, EntityUid? StorageOwner, string? RootSlot, int Count)>();
+        var visited = new HashSet<EntityUid>();
+
+        void ScanContainerRecursive(EntityUid containerOwner, string? rootSlot, EntityUid? activeStorageOwner, int depth)
+        {
+            if (depth > 3 || !Exists(containerOwner))
+                return;
+
+            EntityUid? currentStorage = HasComp<StorageComponent>(containerOwner) ? containerOwner : activeStorageOwner;
+
+            if (TryComp<StorageComponent>(containerOwner, out var stComp))
+            {
+                foreach (var ent in stComp.Container.ContainedEntities)
+                {
+                    if (!Exists(ent) || !visited.Add(ent))
+                        continue;
+
+                    if (predicate(ent))
+                    {
+                        int count = TryComp<StackComponent>(ent, out var s) ? s.Count : 1;
+                        deepCandidates.Add((ent, currentStorage ?? containerOwner, rootSlot, count));
+                    }
+
+                    ScanContainerRecursive(ent, rootSlot, currentStorage ?? containerOwner, depth + 1);
+                }
+            }
+
+            if (TryComp<ContainerManagerComponent>(containerOwner, out var containerMan))
+            {
+                foreach (var container in _container.GetAllContainers(containerOwner, containerMan))
+                {
+                    foreach (var ent in container.ContainedEntities)
+                    {
+                        if (!Exists(ent) || !visited.Add(ent))
+                            continue;
+
+                        if (predicate(ent))
+                        {
+                            int count = TryComp<StackComponent>(ent, out var s) ? s.Count : 1;
+                            deepCandidates.Add((ent, currentStorage ?? containerOwner, rootSlot, count));
+                        }
+
+                        ScanContainerRecursive(ent, rootSlot, currentStorage ?? containerOwner, depth + 1);
+                    }
+                }
+            }
+        }
+
+        // Scan hands recursively
+        foreach (var handName in hands.Hands.Keys)
+        {
+            if (_container.TryGetContainer(player, handName, out var handCont) && handCont.ContainedEntities.Count > 0)
+            {
+                var heldEnt = handCont.ContainedEntities[0];
+                ScanContainerRecursive(heldEnt, null, HasComp<StorageComponent>(heldEnt) ? heldEnt : null, 1);
+            }
+        }
+
+        // Scan worn slots recursively
+        string[] allSlots =
+        {
+            "belt", "back", "pocket1", "pocket2", "pocket3", "pocket4",
+            "suitstorage", "id", "outerClothing", "gloves", "shoes",
+            "head", "eyes", "ears", "mask", "neck", "jumpsuit"
+        };
+        foreach (var slotName in allSlots)
+        {
+            if (_inventory.TryGetSlotEntity(player, slotName, out var slotEnt) && slotEnt.HasValue)
+            {
+                ScanContainerRecursive(slotEnt.Value, slotName, HasComp<StorageComponent>(slotEnt.Value) ? slotEnt.Value : null, 1);
+            }
+        }
+
+        // Also scan open StorageComponent entities within MaxInteractRange (e.g. open toolbox on the floor)
+        var playerCoords = _transform.GetMapCoordinates(player);
+        if (playerCoords.MapId != MapId.Nullspace)
+        {
+            foreach (var nearEnt in _lookup.GetEntitiesInRange(playerCoords, MaxInteractRange, LookupFlags.Uncontained))
+            {
+                if (nearEnt == player || !Exists(nearEnt) || !HasComp<StorageComponent>(nearEnt))
+                    continue;
+
+                ScanContainerRecursive(nearEnt, null, nearEnt, 1);
+            }
+        }
+
+        if (deepCandidates.Count == 0 || deepCandidates.Sum(c => c.Count) < needed)
+            return false;
+
+        var chosen = deepCandidates
+            .OrderByDescending(c => c.Count >= needed)
+            .ThenByDescending(c => c.Count)
+            .First();
+
+        _itemUtil.StowActiveTrackedItem();
+
+        if (!string.IsNullOrEmpty(chosen.RootSlot))
+        {
+            var rootSlot = chosen.RootSlot;
+            _itemUtil.EnqueueStep(ItemUtilitySystem.StepDelay, () => RaisePredictiveEvent(new OpenSlotStorageNetworkMessage(rootSlot)));
+        }
+
+        if (chosen.StorageOwner is { } storageOwner && Exists(storageOwner))
+        {
+            var itemToFetch = chosen.Item;
+            _itemUtil.EnqueueStep(ItemUtilitySystem.StepDelay, () =>
+            {
+                if (!Exists(itemToFetch) || !Exists(storageOwner))
+                    return;
+                EnsureEmptyActiveHandImmediate(player);
+                RaisePredictiveEvent(new StorageInteractWithItemEvent(GetNetEntity(itemToFetch), GetNetEntity(storageOwner)));
+            });
+            return true;
+        }
+
+        _itemUtil.EnqueueClickEntity(chosen.Item);
+        return true;
+    }
+
+    private void EnsureEmptyActiveHandImmediate(EntityUid player)
+    {
+        if (!TryComp<HandsComponent>(player, out var hands))
+            return;
+
+        var activeHand = _hands.GetActiveHand(player);
+        if (activeHand != null && _hands.GetActiveItem(player) == null)
+            return;
+
+        foreach (var handName in hands.Hands.Keys)
+        {
+            if (_container.TryGetContainer(player, handName, out var cont) && cont.ContainedEntities.Count == 0)
+            {
+                RaisePredictiveEvent(new RequestSetHandEvent(handName));
+                return;
+            }
         }
     }
 
@@ -1428,11 +2390,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         if (!Exists(uid) || string.IsNullOrEmpty(partId))
             return false;
 
-        if (TryComp<StackComponent>(uid, out var stack) &&
-            string.Equals(stack.StackTypeId, partId, StringComparison.OrdinalIgnoreCase))
-        {
+        if (MatchesMaterialOrStack(uid, partId))
             return true;
-        }
 
         foreach (var comp in EntityManager.GetComponents(uid))
         {
@@ -1463,7 +2422,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             }
         }
 
-        return _tagSystem.HasTag(uid, partId);
+        return HasValidTag(uid, partId);
     }
 
     private void StartGhostConstruction(EntityUid ghostUid)
@@ -1588,9 +2547,9 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     }
 
     private bool TryRelocateTargetEntity(out EntityUid found)
-        => TryRelocateReplacementEntity(EntityUid.Invalid, out found);
+        => TryRelocateReplacementEntity(EntityUid.Invalid, out found, ignorePreExisting: true);
 
-    private bool TryRelocateReplacementEntity(EntityUid excludeEntity, out EntityUid found)
+    private bool TryRelocateReplacementEntity(EntityUid excludeEntity, out EntityUid found, bool ignorePreExisting = true)
     {
         found = EntityUid.Invalid;
         if (_targetMapCoords.MapId == MapId.Nullspace)
@@ -1602,6 +2561,9 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         foreach (var uid in candidates)
         {
             if (uid == excludeEntity || !Exists(uid) || Deleted(uid) || HasGhostComponent(uid))
+                continue;
+
+            if (ignorePreExisting && _preExistingTileEntities.Contains(uid))
                 continue;
 
             if (!_solver.TryResolveGraphAndNode(uid, out var graph, out _, out _) || graph == null)
@@ -1626,7 +2588,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     }
 
     private bool TryRelocateNonGhostTarget(out EntityUid found)
-        => TryRelocateTargetEntity(out found);
+        => TryRelocateReplacementEntity(_currentTarget, out found, ignorePreExisting: true);
 
     private bool IsGhostOrUnfinishedFrame(EntityUid uid)
     {
@@ -1763,6 +2725,166 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         return null;
     }
 
+    private IComponent? FindComponentByName(EntityUid uid, string componentTypeName)
+    {
+        foreach (var comp in EntityManager.GetComponents(uid))
+        {
+            if (string.Equals(comp.GetType().Name, componentTypeName, StringComparison.OrdinalIgnoreCase))
+                return comp;
+        }
+        return null;
+    }
+
+    private static string? GetStringMember(object? obj, string name)
+    {
+        var val = GetMemberValue(obj, name);
+        if (val == null)
+            return null;
+        if (val is string s)
+            return s;
+        if (GetMemberValue(val, "Id") is string idStr)
+            return idStr;
+        return val.ToString();
+    }
+
     private static bool GetBoolMember(object? obj, string name)
         => GetMemberValue(obj, name) is true;
+
+    private static bool TryGetStepTargetPipeLayer(ConstructionActionStep step, out int targetPipeLayer)
+    {
+        targetPipeLayer = 0;
+        if (step.Kind != ConstructionActionKind.UseTool ||
+            !step.Description.StartsWith("Set pipe layer", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (step.Description.Contains("Alt1", StringComparison.OrdinalIgnoreCase) ||
+            step.Description.Contains("Secondary", StringComparison.OrdinalIgnoreCase))
+        {
+            targetPipeLayer = 1;
+            return true;
+        }
+
+        if (step.Description.Contains("Alt2", StringComparison.OrdinalIgnoreCase) ||
+            step.Description.Contains("Tertiary", StringComparison.OrdinalIgnoreCase))
+        {
+            targetPipeLayer = 2;
+            return true;
+        }
+
+        targetPipeLayer = 0;
+        return true;
+    }
+}
+
+/// <summary>
+/// Ensures exported blueprints always capture pipe-layer positions (Primary / Alt1 / Alt2)
+/// for connectors, mixers, filters, vents, pumps, and pipes on the grid.
+/// </summary>
+[HarmonyPatch(typeof(RobustaBlueprintManager), nameof(RobustaBlueprintManager.ExportAreaAsBlueprint))]
+public static class BlueprintExportPipeLayerPatch
+{
+    [HarmonyPostfix]
+    public static void Postfix(
+        RobustaBlueprintManager __instance,
+        EntityUid gridUid,
+        Vector2i corner1,
+        Vector2i corner2,
+        string blueprintName,
+        RobustaBlueprint? __result)
+    {
+        if (__result == null || __result.Items.Count == 0)
+            return;
+
+        try
+        {
+            var entMan = IoCManager.Resolve<IEntityManager>();
+            if (!entMan.EntityExists(gridUid) ||
+                !entMan.TryGetComponent<MapGridComponent>(gridUid, out var grid) ||
+                !entMan.EntitySysManager.TryGetEntitySystem<SharedMapSystem>(out var mapSys) ||
+                !entMan.EntitySysManager.TryGetEntitySystem<RobustaConstructionSolver>(out var solver))
+            {
+                return;
+            }
+
+            int minX = Math.Min(corner1.X, corner2.X);
+            int maxX = Math.Max(corner1.X, corner2.X);
+            int minY = Math.Min(corner1.Y, corner2.Y);
+            int maxY = Math.Max(corner1.Y, corner2.Y);
+
+            var matchedItems = new HashSet<BlueprintItemEntry>();
+            bool anyModified = false;
+
+            var gridXform = entMan.GetComponent<TransformComponent>(gridUid);
+            var childEnumerator = gridXform.ChildEnumerator;
+            while (childEnumerator.MoveNext(out var uid))
+            {
+                if (!entMan.EntityExists(uid) || entMan.Deleted(uid) || entMan.IsClientSide(uid))
+                    continue;
+
+                if (entMan.HasComponent<ConstructionGhostComponent>(uid))
+                    continue;
+
+                var xform = entMan.GetComponent<TransformComponent>(uid);
+                if (!xform.Anchored)
+                    continue;
+
+                var meta = entMan.GetComponent<MetaDataComponent>(uid);
+                var rawProtoId = meta.EntityPrototype?.ID;
+                if (string.IsNullOrEmpty(rawProtoId))
+                    continue;
+
+                var tile = mapSys.TileIndicesFor(gridUid, grid, xform.Coordinates);
+                if (tile.X < minX || tile.X > maxX || tile.Y < minY || tile.Y > maxY)
+                    continue;
+
+                int ox = tile.X - minX;
+                int oy = tile.Y - minY;
+                var dir = xform.LocalRotation.GetCardinalDir().ToString();
+
+                solver.ResolveExportBlueprintPrototypes(
+                    uid,
+                    rawProtoId,
+                    out var exportedEntityProtoId,
+                    out var exportedConstructionProtoId);
+
+                // Only needed if rawProtoId differs from exportedEntityProtoId (e.g. when RobustaBlueprintManager.cs wasn't updated)
+                if (string.Equals(rawProtoId, exportedEntityProtoId, StringComparison.Ordinal))
+                    continue;
+
+                foreach (var item in __result.Items)
+                {
+                    if (matchedItems.Contains(item))
+                        continue;
+
+                    if (item.OffsetX != ox ||
+                        item.OffsetY != oy ||
+                        !string.Equals(item.Direction, dir, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (!string.Equals(item.EntityPrototypeId, rawProtoId, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    matchedItems.Add(item);
+                    item.EntityPrototypeId = exportedEntityProtoId;
+                    if (!string.IsNullOrEmpty(exportedConstructionProtoId))
+                        item.ConstructionPrototypeId = exportedConstructionProtoId;
+                    anyModified = true;
+                    break;
+                }
+            }
+
+            if (anyModified)
+            {
+                __instance.SaveBlueprint(__result, blueprintName);
+            }
+        }
+        catch
+        {
+            // Ignore patch errors so blueprint export never throws
+        }
+    }
 }
