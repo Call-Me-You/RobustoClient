@@ -186,6 +186,20 @@ public sealed class RobustaConstructionSolver : EntitySystem
         "BaseRecharger"
     };
 
+    private static readonly string[] BaseAirlockPrototypeIds =
+    {
+        "BaseAirlock",
+        "Airlock",
+        "AirlockGlass",
+        "AirlockShuttle",
+        "AirlockGlassShuttle",
+        "AirlockExternal",
+        "AirlockExternalGlass",
+        "AirlockExternalShuttle",
+        "AirlockExternalGlassShuttle",
+        "HighSecDoor"
+    };
+
     private string? _lastKnownMachineBoardProtoId;
 
     public void NoteHeldEntity(EntityUid? heldUid)
@@ -269,6 +283,15 @@ public sealed class RobustaConstructionSolver : EntitySystem
 
         TryFindComputerGraphAndNode(out var compGraph, out var compNode);
         TryFindMachineGraphAndNode(out var machineGraph, out var machineNode);
+        TryFindAirlockGraphAndNode(out var airlockGraph, out var airlockNode);
+
+        if (airlockGraph != null && airlockNode != null)
+        {
+            foreach (var baseAirlockId in BaseAirlockPrototypeIds)
+            {
+                RegisterEntityNodeMapping(baseAirlockId, airlockGraph, airlockNode);
+            }
+        }
 
         // Register all intermediate ComputerFrame nodes so ComputerFrame can disambiguate its exact stage
         if (compGraph != null)
@@ -368,6 +391,15 @@ public sealed class RobustaConstructionSolver : EntitySystem
                 {
                     RegisterEntityNodeMapping(entityProto.ID, compGraph, compNode);
                 }
+            }
+
+            if (airlockGraph != null && airlockNode != null &&
+                !string.Equals(entityProto.ID, "AirlockAssembly", StringComparison.OrdinalIgnoreCase) &&
+                !entityProto.ID.Contains("Windoor", StringComparison.OrdinalIgnoreCase) &&
+                (_itemUtil.HasPrototypeComponent(entityProto, "Airlock") ||
+                 _itemUtil.HasPrototypeComponent(entityProto, "WiresPanelSecurity")))
+            {
+                RegisterEntityNodeMapping(entityProto.ID, airlockGraph, airlockNode);
             }
 
             if (_itemUtil.TryGetPrototypeComponent<ElectronicsBoardComponent>(entityProto, "ElectronicsBoard", out var elecBoard) &&
@@ -500,6 +532,39 @@ public sealed class RobustaConstructionSolver : EntitySystem
                 machineNode = n;
                 return true;
             }
+        }
+
+        return false;
+    }
+
+    private bool TryFindAirlockGraphAndNode(
+        out ConstructionGraphPrototype? airlockGraph,
+        out ConstructionGraphNode? airlockNode)
+    {
+        airlockGraph = null;
+        airlockNode = null;
+
+        if (!TryGetGraph("Airlock", out var g))
+        {
+            foreach (var candidate in _protoMan.EnumeratePrototypes<ConstructionGraphPrototype>())
+            {
+                if (TryGetNodeByName(candidate, "airlock", out _) &&
+                    TryGetNodeByName(candidate, "assembly", out _))
+                {
+                    g = candidate;
+                    break;
+                }
+            }
+        }
+
+        if (g == null)
+            return false;
+
+        airlockGraph = g;
+        if (TryGetNodeByName(g, "airlock", out var namedNode))
+        {
+            airlockNode = namedNode;
+            return true;
         }
 
         return false;
@@ -699,7 +764,10 @@ public sealed class RobustaConstructionSolver : EntitySystem
     /// <summary>
     /// Solves the construction graph from the entity's current node to an explicit target node.
     /// </summary>
-    public SolvedConstructionPlan? SolvePlanToNode(EntityUid target, string targetNodeName)
+    public SolvedConstructionPlan? SolvePlanToNode(
+        EntityUid target,
+        string targetNodeName,
+        string? startNodeOverride = null)
     {
         if (!_entMan.EntityExists(target) || string.IsNullOrWhiteSpace(targetNodeName))
             return null;
@@ -708,10 +776,27 @@ public sealed class RobustaConstructionSolver : EntitySystem
         if (!TryResolveGraphAndNode(target, out var graph, out var currentNode, out _) ||
             graph == null || currentNode == null)
         {
-            return null;
+            if (FindComponentByName(target, "WiresPanelSecurityComponent") != null &&
+                TryFindAirlockGraphAndNode(out var fallbackAirlockGraph, out var fallbackAirlockNode) &&
+                fallbackAirlockGraph != null && fallbackAirlockNode != null)
+            {
+                graph = fallbackAirlockGraph;
+                currentNode = fallbackAirlockNode;
+                ApplyAirlockSecurityNodeOverride(target, graph, ref currentNode);
+            }
+            else
+            {
+                return null;
+            }
         }
 
-        var currentNodeName = GetNodeName(currentNode);
+        if (!string.IsNullOrWhiteSpace(startNodeOverride) &&
+            TryGetNodeByName(graph, startNodeOverride, out var overrideNode))
+        {
+            currentNode = overrideNode;
+        }
+
+        var currentNodeName = GetNodeName(currentNode!);
         if (string.Equals(currentNodeName, targetNodeName, StringComparison.OrdinalIgnoreCase))
             return new SolvedConstructionPlan(graph.ID, currentNodeName, targetNodeName, false, []);
 
@@ -738,6 +823,103 @@ public sealed class RobustaConstructionSolver : EntitySystem
         return new SolvedConstructionPlan(graph.ID, currentNodeName, targetNodeName, false, steps);
     }
 
+    public string? ResolveCurrentSecurityNode(
+        EntityUid target,
+        object? secComp = null,
+        ConstructionGraphPrototype? graph = null)
+    {
+        EnsureCacheInitialized();
+
+        if (graph == null)
+            TryFindAirlockGraphAndNode(out graph, out _);
+
+        secComp ??= FindComponentByName(target, "WiresPanelSecurityComponent");
+        if (secComp == null)
+            return null;
+
+        if (GetMemberValue(secComp, "WiresAccessible") is true)
+            return "airlock";
+
+        var examine = GetStringMember(secComp, "Examine");
+        if (graph != null && !string.IsNullOrEmpty(examine))
+        {
+            // 1. Check node actions if present on the graph
+            foreach (var n in EnumerateGraphNodes(graph))
+            {
+                var actions = GetMemberValue(n, "Actions") as IEnumerable
+                              ?? GetMemberValue(n, "_actions") as IEnumerable;
+                if (actions == null)
+                    continue;
+
+                foreach (var act in actions)
+                {
+                    if (act == null)
+                        continue;
+
+                    var actExamine = GetStringMember(act, "Examine");
+                    if (string.Equals(actExamine, examine, StringComparison.OrdinalIgnoreCase))
+                        return GetNodeName(n);
+                }
+            }
+        }
+
+        // 2. Map standard locale IDs, adapting to the actual nodes present in the Airlock graph
+        var mapped = GetSecurityRemovalTarget(examine);
+        if (!string.IsNullOrEmpty(mapped))
+        {
+            if (graph == null || TryGetNodeByName(graph, mapped, out _))
+                return mapped;
+
+            if (string.Equals(examine, "wires-panel-component-on-examine-security-level5", StringComparison.OrdinalIgnoreCase) &&
+                TryGetNodeByName(graph, "maxSecurityUnfinished", out _))
+            {
+                return "maxSecurityUnfinished";
+            }
+
+            if ((string.Equals(examine, "wires-panel-component-on-examine-security-level6", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(examine, "wires-panel-component-on-examine-security-level7", StringComparison.OrdinalIgnoreCase)) &&
+                TryGetNodeByName(graph, "maxSecurity", out _))
+            {
+                return "maxSecurity";
+            }
+        }
+
+        // 3. Fallback to the component/prototype's SecurityLevel field
+        var secLevel = GetStringMember(secComp, "SecurityLevel");
+        if (string.IsNullOrEmpty(secLevel) && _entMan.EntityExists(target))
+        {
+            var proto = _entMan.GetComponent<MetaDataComponent>(target).EntityPrototype;
+            if (proto != null && _itemUtil.TryGetPrototypeComponent<object>(proto, "WiresPanelSecurity", out var protoSec))
+                secLevel = GetStringMember(protoSec, "SecurityLevel");
+        }
+
+        if (!string.IsNullOrEmpty(secLevel) && (graph == null || TryGetNodeByName(graph, secLevel, out _)))
+            return secLevel;
+
+        return mapped;
+    }
+
+    public string? ResolveNextSecurityNode(EntityUid target, string currentNodeName)
+    {
+        if (string.IsNullOrEmpty(currentNodeName))
+            return null;
+
+        EnsureCacheInitialized();
+
+        if (TryFindAirlockGraphAndNode(out var graph, out _) && graph != null)
+        {
+            var path = FindShortestEdgePath(graph, currentNodeName, "airlock");
+            if (path != null && path.Count > 0)
+            {
+                var nextInGraph = GetNodeName(path[0].To);
+                if (!string.IsNullOrEmpty(nextInGraph))
+                    return nextInGraph;
+            }
+        }
+
+        return GetNextSecurityNode(currentNodeName);
+    }
+
     public static string? GetSecurityRemovalTarget(string? examine)
     {
         return examine switch
@@ -760,6 +942,7 @@ public sealed class RobustaConstructionSolver : EntitySystem
             "medSecurity" => "medSecurityUnfinished",
             "highSecurity" => "highSecurityUnfinished",
             "maxSecurity" => "highSecurity",
+            "maxSecurityUnfinished" => "airlock",
             "superMaxSecurity" => "superMaxSecurityUnfinished",
             "superMaxSecurityUnfinished" => "maxSecurity",
             "medSecurityUnfinished" or "highSecurityUnfinished" => "airlock",
@@ -1034,13 +1217,19 @@ public sealed class RobustaConstructionSolver : EntitySystem
             return false;
         }
 
-        // Airlocks and Windoors require all internal wires in the wire panel to be cut before prying/unwrenching
-        if (string.Equals(graphId, "Airlock", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(graphId, "Windoor", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(nodeName, "airlock", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(nodeName, "windoor", StringComparison.OrdinalIgnoreCase))
+        // Airlocks and Windoors require all internal wires in the wire panel to be cut when leaving the main door node
+        if (string.Equals(nodeName, "airlock", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(nodeName, "glassAirlock", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(nodeName, "windoor", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(nodeName, "windoorSecure", StringComparison.OrdinalIgnoreCase))
         {
             return true;
+        }
+
+        if (string.Equals(graphId, "Airlock", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(graphId, "Windoor", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
         }
 
         if (panelComp != null && HasWiresUserInterface(target))
@@ -1110,6 +1299,20 @@ public sealed class RobustaConstructionSolver : EntitySystem
             return true;
 
         var currentProtoId = _entMan.GetComponent<MetaDataComponent>(currentTarget).EntityPrototype?.ID;
+
+        // Transitions on an already-constructed Airlock between "airlock" and any wire-panel security node
+        // happen in-place on the existing Airlock entity without replacing or deleting it.
+        if (string.Equals(graph.ID, "Airlock", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(currentProtoId, "AirlockAssembly", StringComparison.OrdinalIgnoreCase))
+        {
+            var toNodeName = GetNodeName(toNode);
+            if (string.Equals(toNodeName, "airlock", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(toNodeName, "glassAirlock", StringComparison.OrdinalIgnoreCase) ||
+                toNodeName.Contains("Security", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
 
         var entObj = GetMemberValue(toNode, "Entity") ?? GetMemberValue(toNode, "_entity");
         if (entObj != null && entObj.GetType().Name.Contains("BoardNodeEntity", StringComparison.OrdinalIgnoreCase))
@@ -1332,6 +1535,7 @@ public sealed class RobustaConstructionSolver : EntitySystem
                 !string.IsNullOrEmpty(nodeName) &&
                 TryGetNodeByName(graph, nodeName, out node))
             {
+                ApplyAirlockSecurityNodeOverride(target, graph, ref node);
                 return true;
             }
         }
@@ -1354,19 +1558,7 @@ public sealed class RobustaConstructionSolver : EntitySystem
                     var chosen = SelectBestNodeCandidate(target, candidates);
                     graph = chosen.Graph;
                     node = chosen.Node;
-
-                    // If this is an Airlock with active WiresPanelSecurityComponent, resolve its current security node
-                    if (string.Equals(graph.ID, "Airlock", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var secComp = FindComponentByName(target, "WiresPanelSecurityComponent");
-                        if (secComp != null && GetMemberValue(secComp, "WiresAccessible") is false)
-                        {
-                            var secNodeName = GetSecurityRemovalTarget(GetStringMember(secComp, "Examine"));
-                            if (!string.IsNullOrEmpty(secNodeName) && TryGetNodeByName(graph, secNodeName, out var secNode))
-                                node = secNode;
-                        }
-                    }
-
+                    ApplyAirlockSecurityNodeOverride(target, graph, ref node);
                     return true;
                 }
 
@@ -1381,8 +1573,21 @@ public sealed class RobustaConstructionSolver : EntitySystem
             }
         }
 
-        // 3. Live-component fallback for Consoles (ComputerComponent) and Machines (MachineComponent)
+        // 3. Live-component fallback for Airlocks, Consoles (ComputerComponent), and Machines (MachineComponent)
         var protoIdStr = proto?.ID ?? string.Empty;
+        if (!string.Equals(protoIdStr, "AirlockAssembly", StringComparison.OrdinalIgnoreCase) &&
+            !protoIdStr.Contains("Windoor", StringComparison.OrdinalIgnoreCase) &&
+            (FindComponentByName(target, "AirlockComponent") != null ||
+             FindComponentByName(target, "WiresPanelSecurityComponent") != null) &&
+            TryFindAirlockGraphAndNode(out var airlockGraph, out var airlockNode) &&
+            airlockGraph != null && airlockNode != null)
+        {
+            graph = airlockGraph;
+            node = airlockNode;
+            ApplyAirlockSecurityNodeOverride(target, graph, ref node);
+            return true;
+        }
+
         if (!string.Equals(protoIdStr, "ComputerFrame", StringComparison.OrdinalIgnoreCase) &&
             !string.Equals(protoIdStr, "ComputerBroken", StringComparison.OrdinalIgnoreCase) &&
             (FindComponentByName(target, "ComputerComponent") != null ||
@@ -1411,6 +1616,31 @@ public sealed class RobustaConstructionSolver : EntitySystem
         }
 
         return false;
+    }
+
+    private void ApplyAirlockSecurityNodeOverride(
+        EntityUid target,
+        ConstructionGraphPrototype graph,
+        ref ConstructionGraphNode? node)
+    {
+        if (!string.Equals(graph.ID, "Airlock", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var secComp = FindComponentByName(target, "WiresPanelSecurityComponent");
+        if (secComp == null)
+            return;
+
+        if (GetMemberValue(secComp, "WiresAccessible") is false)
+        {
+            var secNodeName = ResolveCurrentSecurityNode(target, secComp, graph);
+            if (!string.IsNullOrEmpty(secNodeName) && TryGetNodeByName(graph, secNodeName, out var secNode))
+                node = secNode;
+        }
+        else if (node != null && GetNodeName(node).Contains("Security", StringComparison.OrdinalIgnoreCase))
+        {
+            if (TryGetNodeByName(graph, "airlock", out var airlockNode))
+                node = airlockNode;
+        }
     }
 
     public bool HasMachineFrameBoard(EntityUid uid)
@@ -1459,6 +1689,13 @@ public sealed class RobustaConstructionSolver : EntitySystem
             string.Equals(protoId, "ComputerFrame", StringComparison.OrdinalIgnoreCase))
         {
             return TryGetSpriteLayerZeroState(uid, out _);
+        }
+
+        if (string.Equals(graphId, "Airlock", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(protoId, "AirlockAssembly", StringComparison.OrdinalIgnoreCase) &&
+            FindComponentByName(uid, "WiresPanelSecurityComponent") != null)
+        {
+            return true;
         }
 
         return false;
@@ -3267,8 +3504,11 @@ public sealed class RobustaConstructionSolver : EntitySystem
             return;
         }
 
-        // 3. PrototypeConstructionGraphStep
-        if (typeName.Contains("PrototypeConstructionGraphStep", StringComparison.OrdinalIgnoreCase))
+        // 3. PrototypeConstructionGraphStep / EntityInsertConstructionGraphStep
+        if (typeName.Contains("PrototypeConstructionGraphStep", StringComparison.OrdinalIgnoreCase) ||
+            (typeName.Contains("EntityInsertConstructionGraphStep", StringComparison.OrdinalIgnoreCase) &&
+             !typeName.Contains("Component", StringComparison.OrdinalIgnoreCase) &&
+             !typeName.Contains("Tag", StringComparison.OrdinalIgnoreCase)))
         {
             var protoId = GetStringMember(stepObj, "Prototype")
                           ?? GetStringMember(stepObj, "PrototypeId")

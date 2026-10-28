@@ -527,6 +527,13 @@ public sealed partial class RobustaWiresSolver : EntitySystem
             return;
         }
 
+        if (solve.RemovingSecurity)
+        {
+            solve.RemovingSecurity = false;
+            solve.ToolRequested = false;
+            solve.Elapsed = 0f;
+        }
+
         TrySyncOpenWiresState(solve.Target);
         if (!_states.ContainsKey(solve.Target))
         {

@@ -20,8 +20,22 @@ public sealed partial class RobustaWiresSolver
                 return;
             }
 
+            if (security.WiresAccessible)
+            {
+                solve.RemovingSecurity = false;
+                solve.ToolRequested = false;
+                solve.Elapsed = 0f;
+                return;
+            }
+
             if (security.Examine == solve.SecurityExamine)
             {
+                if (solve.Elapsed < 0.6f)
+                {
+                    solve.Timer = 0.05f;
+                    return;
+                }
+
                 FailSolve("security removal did not change the replicated security state");
                 return;
             }
@@ -36,15 +50,15 @@ public sealed partial class RobustaWiresSolver
             return;
         }
 
-        var nodeName = RobustaConstructionSolver.GetSecurityRemovalTarget(security.Examine);
-        var nextNode = nodeName != null ? RobustaConstructionSolver.GetNextSecurityNode(nodeName) : null;
+        var nodeName = _constructionSolver.ResolveCurrentSecurityNode(solve.Target, security);
+        var nextNode = nodeName != null ? _constructionSolver.ResolveNextSecurityNode(solve.Target, nodeName) : null;
         if (nodeName == null || nextNode == null)
         {
             FailSolve($"unsupported panel security state: {security.Examine}");
             return;
         }
 
-        var plan = _constructionSolver.SolvePlanToNode(solve.Target, nextNode);
+        var plan = _constructionSolver.SolvePlanToNode(solve.Target, nextNode, nodeName);
         if (plan == null || plan.Steps.Count == 0)
         {
             FailSolve("could not solve construction plan for panel security removal");

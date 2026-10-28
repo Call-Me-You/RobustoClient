@@ -284,18 +284,10 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     private void FinishCurrentPlan(bool cancelled = false)
     {
         _itemUtil.CancelAll();
-        if (cancelled)
+        ExtinguishActiveWelderIfNeeded();
+        if (!cancelled && _blueprintQueue.Count == 0 && !_wiresSolver.IsSolving)
         {
-            ExtinguishActiveWelderIfNeeded();
-        }
-        else if (_blueprintQueue.Count == 0)
-        {
-            _litWelderUid = null;
             _itemUtil.StowActiveTrackedItem();
-        }
-        else
-        {
-            ExtinguishActiveWelderIfNeeded();
         }
 
         if (Exists(_currentTarget) && HasGhostComponent(_currentTarget))
