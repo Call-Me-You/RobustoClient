@@ -29,19 +29,13 @@ public sealed record VerifyWireStateStep(string Binding, bool? ExpectedCut = nul
 
 public sealed record UseWiresIntentStep(string IntentName) : WiresIntentStep;
 
-/// <summary>
-/// Runs a prerequisite intent when the target's door bolts are down.
-/// </summary>
+/// <summary>Runs a prerequisite intent when the target's door bolts are down.</summary>
 public sealed record UseIntentIfBoltedStep(string IntentName) : WiresIntentStep;
 
-/// <summary>
-/// Uses a tool on the target and waits for the specified upstream door state.
-/// </summary>
+/// <summary>Uses a tool on the target and waits for the specified upstream door state.</summary>
 public sealed record UseToolOnTargetStep(string ToolQuality, DoorState ExpectedState) : WiresIntentStep;
 
-/// <summary>
-/// Cuts all remaining uncut wires in the panel (cutting Power wires first and Bolt wire last).
-/// </summary>
+/// <summary>Cuts all remaining uncut wires in the panel (cutting Power wires first and Bolt wire last).</summary>
 public sealed record CutAllWiresStep : WiresIntentStep;
 
 public sealed record WiresIntentDefinition(string Name, IReadOnlyList<WiresIntentStep> Steps, bool AllowNormallyAvoidedWires = false);
@@ -58,9 +52,7 @@ public sealed record SolvedTargetToolAction(string ToolQuality, DoorState Expect
 
 public sealed record SolvedWiresPlan(EntityUid Target, string IntentName, IReadOnlyList<SolvedWiresStep> Actions);
 
-/// <summary>
-/// Describes why a wire-panel solve could not be started or planned.
-/// </summary>
+/// <summary>Describes why a wire-panel solve could not be started or planned.</summary>
 public enum WiresSolveFailureReason
 {
     None,
@@ -474,8 +466,8 @@ public sealed partial class RobustaWiresSolver : EntitySystem
 
         if (!solve.ToolRequested)
         {
-            solve.ToolRequested = _itemUtility.TryEquipByPredicate(
-                uid => _tools.HasQuality(uid, panel.OpeningTool),
+            solve.ToolRequested = _construction.TryEquipToolOrMultiTool(
+                panel.OpeningTool,
                 $"Panel:{panel.OpeningTool}");
             if (!solve.ToolRequested)
             {
@@ -489,6 +481,15 @@ public sealed partial class RobustaWiresSolver : EntitySystem
         if (_itemUtility.IsBusy)
         {
             solve.Timer = 0f;
+            return;
+        }
+
+        if (!_construction.EnsureHeldToolModeReady(panel.OpeningTool, out bool failedPanelCycle))
+        {
+            if (failedPanelCycle)
+                FailSolve($"could not cycle tool to {panel.OpeningTool}");
+            else
+                solve.Timer = 0.25f;
             return;
         }
 
@@ -531,10 +532,8 @@ public sealed partial class RobustaWiresSolver : EntitySystem
         {
             if (!solve.ToolRequested)
             {
-                solve.ToolRequested = _itemUtility.TryEquipByPredicate(
-                    uid => _tools.HasQuality(uid, SharedToolSystem.CutQuality), "Wirecutters") ||
-                    _itemUtility.TryEquipByPredicate(
-                        uid => _tools.HasQuality(uid, SharedToolSystem.PulseQuality), "Multitool");
+                solve.ToolRequested = _construction.TryEquipToolOrMultiTool(SharedToolSystem.CutQuality, "Wirecutters") ||
+                                      _construction.TryEquipToolOrMultiTool(SharedToolSystem.PulseQuality, "Multitool");
                 if (!solve.ToolRequested)
                 {
                     FailSolve("could not equip wirecutters or a multitool");
@@ -545,6 +544,15 @@ public sealed partial class RobustaWiresSolver : EntitySystem
             if (_itemUtility.IsBusy)
             {
                 solve.Timer = 0f;
+                return;
+            }
+
+            if (!_construction.EnsureHeldWireUiToolReady(out bool failedWireUiCycle))
+            {
+                if (failedWireUiCycle)
+                    FailSolve("could not cycle tool to wirecutters or multitool mode");
+                else
+                    solve.Timer = 0.25f;
                 return;
             }
 
@@ -660,8 +668,8 @@ public sealed partial class RobustaWiresSolver : EntitySystem
 
         if (!solve.ToolRequested)
         {
-            solve.ToolRequested = _itemUtility.TryEquipByPredicate(
-                uid => _tools.HasQuality(uid, action.ToolQuality),
+            solve.ToolRequested = _construction.TryEquipToolOrMultiTool(
+                action.ToolQuality,
                 action.ToolQuality);
             if (!solve.ToolRequested)
             {
@@ -673,6 +681,15 @@ public sealed partial class RobustaWiresSolver : EntitySystem
         if (_itemUtility.IsBusy)
         {
             solve.Timer = 0f;
+            return;
+        }
+
+        if (!_construction.EnsureHeldToolModeReady(action.ToolQuality, out bool failedActionCycle))
+        {
+            if (failedActionCycle)
+                FailSolve($"could not cycle tool to {action.ToolQuality}");
+            else
+                solve.Timer = 0.25f;
             return;
         }
 

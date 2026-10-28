@@ -29,9 +29,8 @@ public sealed partial class RobustaWiresSolver
 
         if (!solve.ToolRequested)
         {
-            solve.ToolRequested = _itemUtility.TryEquipByPredicate(
-                uid => _tools.HasQuality(uid, action.ToolQuality) &&
-                       (!TryComp<PryingComponent>(uid, out var prying) || prying.Enabled),
+            solve.ToolRequested = _construction.TryEquipToolOrMultiTool(
+                action.ToolQuality,
                 $"Tool:{action.ToolQuality}");
             if (!solve.ToolRequested)
                 FailSolve($"could not equip an enabled {action.ToolQuality} tool");
@@ -41,8 +40,18 @@ public sealed partial class RobustaWiresSolver
         if (_itemUtility.IsBusy)
             return;
 
+        if (!_construction.EnsureHeldToolModeReady(action.ToolQuality, out bool failedTargetToolCycle))
+        {
+            if (failedTargetToolCycle)
+                FailSolve($"could not cycle tool to {action.ToolQuality}");
+            else
+                solve.Timer = 0.25f;
+            return;
+        }
+
         if (_playerManager.LocalEntity is not { } player ||
-            _hands.GetActiveItem(player) is not { } held || !_tools.HasQuality(held, action.ToolQuality))
+            _hands.GetActiveItem(player) is not { } held ||
+            !_construction.IsToolReadyForQuality(held, action.ToolQuality))
         {
             FailSolve("required tool was not equipped");
             return;
