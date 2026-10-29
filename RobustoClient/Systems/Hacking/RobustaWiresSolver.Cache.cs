@@ -19,9 +19,7 @@ public sealed partial class RobustaWiresSolver
         return _confirmedPowerSolutions.Contains(GetSolution(target, state));
     }
 
-    /// <summary>
-    /// Describes the current confidence in a cached panel mapping.
-    /// </summary> 
+    /// <summary>Describes the current confidence in a cached panel mapping.</summary>
     public enum WiresSolutionStatus
     {
         Unknown,
@@ -68,17 +66,13 @@ public sealed partial class RobustaWiresSolver
         return true;
     }
 
-    /// <summary>
-    /// Returns whether the current panel profile has at least one learned mapping.
-    /// </summary>
+    /// <summary>Returns whether the current panel profile has at least one learned mapping.</summary>
     public bool HasSolution(EntityUid target)
     {
         return _states.TryGetValue(target, out var state) && GetSolution(target, state).Count > 0;
     }
 
-    /// <summary>
-    /// Gets the current cache status for the target's panel profile.
-    /// </summary>
+    /// <summary>Gets the current cache status for the target's panel profile.</summary>
     public WiresSolutionStatus GetSolutionStatus(EntityUid target)
     {
         if (!_states.TryGetValue(target, out var state))
@@ -88,23 +82,20 @@ public sealed partial class RobustaWiresSolver
         return solution.Count == 0 ? WiresSolutionStatus.Unknown : WiresSolutionStatus.Partial;
     }
 
-    /// <summary>
-    /// Supplies the latest state received from the upstream wire BUI.
-    /// </summary>
+    /// <summary>Supplies the latest state received from the upstream wire BUI.</summary>
     public void ObserveState(EntityUid target, WiresBoundUserInterfaceState state)
     {
         _states[target] = state;
         _stateRevisions[target] = _stateRevisions.GetValueOrDefault(target) + 1;
     }
 
-    /// <summary>
-    /// Notifies the solver that an upstream BUI action was sent for an active solve.
-    /// </summary>
+    /// <summary>Notifies the solver that an upstream BUI action was sent for an active solve.</summary>
     public void ObserveAction(EntityUid target, int wireId, WiresAction action)
     {
         if (_activeSolve?.Target != target || _activeSolve.Phase != SolvePhase.ExecuteAction)
             return;
 
+        _phaseRetryTimer = 0f;
         _activeSolve.SentWireId = wireId;
         _activeSolve.SentAction = action;
         _activeSolve.SentStateRevision = _stateRevisions.GetValueOrDefault(target);

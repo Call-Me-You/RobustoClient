@@ -105,10 +105,23 @@ public sealed partial class RobustaWiresSolver : EntitySystem
     [Dependency] private readonly SharedToolSystem _tools = default!;
     [Dependency] private readonly SharedUserInterfaceSystem _uiSystem = default!;
 
+    private const int CheckFrameInterval = 5;
+    private const float SolveTimeoutSeconds = 60f;
+    private const float PhaseRetryIntervalSeconds = 1.25f;
+
     private readonly Dictionary<string, WiresIntentDefinition> _intents = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<Type, StepExpander> _stepExpanders = new();
     private ActiveSolve? _activeSolve;
     private ISawmill _log = default!;
+
+    private int _frameCheckCounter;
+    private float _frameDeltaAccumulator;
+    private float _phaseRetryTimer;
+
+    private string? _hudBannerHeader;
+    private string? _hudBannerDetail;
+    private bool _hudBannerIsError;
+    private float _hudBannerTimer;
 
     public bool IsSolving => _activeSolve != null;
 
@@ -124,20 +137,48 @@ public sealed partial class RobustaWiresSolver : EntitySystem
     {
         base.FrameUpdate(frameTime);
 
-        if (_activeSolve == null)
-            return;
+        if (_hudBannerTimer > 0f)
+            _hudBannerTimer = Math.Max(0f, _hudBannerTimer - frameTime);
 
-        if (_playerManager.LocalEntity is { } player && IsPlayerInActiveDoAfter(player))
+        if (_activeSolve == null)
         {
-            _activeSolve.Elapsed = 0f;
+            _frameCheckCounter = 0;
+            _frameDeltaAccumulator = 0f;
+            _phaseRetryTimer = 0f;
             return;
         }
 
-        _activeSolve.Timer -= frameTime;
-        _activeSolve.Elapsed += frameTime;
-        if (_activeSolve.Elapsed > 10f)
+        if (!Exists(_activeSolve.Target) || Deleted(_activeSolve.Target))
         {
-            FailSolve("timed out waiting for the upstream wire-panel state");
+            FailSolve("target entity no longer exists");
+            return;
+        }
+
+        if (_playerManager.LocalEntity is { } player)
+        {
+            if (IsPlayerInActiveDoAfter(player) || _construction.IsPlayerMoving(player))
+                return;
+        }
+
+        _frameDeltaAccumulator += frameTime;
+        _frameCheckCounter++;
+        if (_frameCheckCounter < CheckFrameInterval)
+            return;
+
+        float stepDt = _frameDeltaAccumulator;
+        _frameDeltaAccumulator = 0f;
+        _frameCheckCounter = 0;
+
+        _activeSolve.Timer -= stepDt;
+        _activeSolve.Elapsed += stepDt;
+        if (_itemUtility.IsBusy)
+            _phaseRetryTimer = 0f;
+        else
+            _phaseRetryTimer += stepDt;
+
+        if (_activeSolve.Elapsed > SolveTimeoutSeconds)
+        {
+            FailSolve($"timed out after {SolveTimeoutSeconds:0}s ({DescribeCurrentSolvePhase(_activeSolve)})");
             return;
         }
 
@@ -254,15 +295,30 @@ public sealed partial class RobustaWiresSolver : EntitySystem
             Phase = SolvePhase.OpenPanel,
             Timer = 0f
         };
+        _phaseRetryTimer = 0f;
+        _hudBannerTimer = 0f;
         return true;
     }
 
-    public void StopSolving()
+    public void StopSolving(string? reason = null)
     {
         bool wasNested = _activeSolve?.NestedFromConstruction == true;
+        if (_activeSolve != null && !string.IsNullOrEmpty(reason) && !wasNested)
+        {
+            ReportStatusBanner("[AutoHack Aborted]", reason, isError: false, duration: 3f);
+        }
         _activeSolve = null;
+        _phaseRetryTimer = 0f;
         if (!wasNested)
             _itemUtility.StowActiveTrackedItem();
+    }
+
+    public void ReportStatusBanner(string header, string detail, bool isError, float duration = 5f)
+    {
+        _hudBannerHeader = header;
+        _hudBannerDetail = detail;
+        _hudBannerIsError = isError;
+        _hudBannerTimer = duration;
     }
 
     private bool ExpandIntent(string intentName, IntentExpansionContext context)
@@ -494,6 +550,7 @@ public sealed partial class RobustaWiresSolver : EntitySystem
         }
 
         ClickTarget(solve.Target);
+        _phaseRetryTimer = 0f;
         solve.Phase = SolvePhase.WaitPanelOpen;
         solve.Timer = 0.25f;
         solve.Elapsed = 0f;
@@ -503,10 +560,20 @@ public sealed partial class RobustaWiresSolver : EntitySystem
     {
         if (!TryComp<WiresPanelComponent>(solve.Target, out var panel) || !panel.Open)
         {
+            if (_phaseRetryTimer >= PhaseRetryIntervalSeconds)
+            {
+                _phaseRetryTimer = 0f;
+                solve.Phase = SolvePhase.OpenPanel;
+                solve.ToolRequested = false;
+                solve.Timer = 0.15f;
+                return;
+            }
+
             solve.Timer = 0f;
             return;
         }
 
+        _phaseRetryTimer = 0f;
         solve.Phase = SolvePhase.OpenWireUi;
         solve.Timer = 0f;
         solve.ToolRequested = false;
@@ -564,6 +631,7 @@ public sealed partial class RobustaWiresSolver : EntitySystem
             }
 
             ClickTarget(solve.Target);
+            _phaseRetryTimer = 0f;
             solve.Phase = SolvePhase.WaitWireUi;
             solve.Timer = 0.25f;
             solve.Elapsed = 0f;
@@ -578,10 +646,20 @@ public sealed partial class RobustaWiresSolver : EntitySystem
         TrySyncOpenWiresState(solve.Target);
         if (!_states.ContainsKey(solve.Target))
         {
+            if (_phaseRetryTimer >= PhaseRetryIntervalSeconds)
+            {
+                _phaseRetryTimer = 0f;
+                solve.Phase = SolvePhase.OpenWireUi;
+                solve.ToolRequested = false;
+                solve.Timer = 0.15f;
+                return;
+            }
+
             solve.Timer = 0f;
             return;
         }
 
+        _phaseRetryTimer = 0f;
         StartPlan(solve);
     }
 
@@ -654,9 +732,15 @@ public sealed partial class RobustaWiresSolver : EntitySystem
 
             _log.Debug($"Solved wire intent {solve.IntentName} on {ToPrettyString(solve.Target)}.");
             bool wasNested = solve.NestedFromConstruction;
+            var targetLabel = Exists(solve.Target) ? Name(solve.Target) : "target";
+            var solvedIntent = solve.IntentName;
             _activeSolve = null;
+            _phaseRetryTimer = 0f;
             if (!wasNested)
+            {
+                ReportStatusBanner("[AutoHack Complete]", $"Completed '{solvedIntent}' on {targetLabel}.", isError: false, duration: 2.5f);
                 _itemUtility.StowActiveTrackedItem();
+            }
             return;
         }
 
@@ -710,6 +794,7 @@ public sealed partial class RobustaWiresSolver : EntitySystem
             return;
         }
 
+        _phaseRetryTimer = 0f;
         solve.SentWireId = action.WireId;
         solve.SentAction = action.Action;
         solve.SentStateRevision = currentRevision;
@@ -735,18 +820,42 @@ public sealed partial class RobustaWiresSolver : EntitySystem
 
         var wire = state.WiresList.FirstOrDefault(w => w.Id == solve.SentWireId.Value);
         var expected = ((SolvedWiresAction) solve.Plan.Actions[solve.ActionIndex]).ExpectedCut;
+        bool boltStateChangedAfterPulse = solve.SentAction == WiresAction.Pulse &&
+                                          IsDoorBolted(solve.Target) != solve.WasBoltedBeforeAction;
+
         if (_stateRevisions.GetValueOrDefault(solve.Target) <= solve.SentStateRevision &&
+            !boltStateChangedAfterPulse &&
             (expected == null || wire == null || wire.IsCut != expected.Value))
         {
+            if (_phaseRetryTimer >= PhaseRetryIntervalSeconds)
+            {
+                _phaseRetryTimer = 0f;
+                solve.Phase = SolvePhase.ExecuteAction;
+                solve.ToolRequested = false;
+                solve.Timer = 0.15f;
+                return;
+            }
+
             solve.Timer = 0f;
             return;
         }
 
         if (wire == null || expected != null && wire.IsCut != expected.Value)
         {
+            if (_phaseRetryTimer >= PhaseRetryIntervalSeconds)
+            {
+                _phaseRetryTimer = 0f;
+                solve.Phase = SolvePhase.ExecuteAction;
+                solve.ToolRequested = false;
+                solve.Timer = 0.15f;
+                return;
+            }
+
             solve.Timer = 0f;
             return;
         }
+
+        _phaseRetryTimer = 0f;
 
         // If cutting a wire during CutAllIntent caused the door bolts to drop (Bolt wire cut while powered),
         // learn the Bolt wire in the cache, defer it to last, and let StartPlan run "Unbolt" (Mend + Pulse) first!
@@ -959,10 +1068,148 @@ public sealed partial class RobustaWiresSolver : EntitySystem
     {
         bool wasNested = _activeSolve?.NestedFromConstruction == true;
         if (_activeSolve != null)
+        {
+            var targetName = Exists(_activeSolve.Target) ? Name(_activeSolve.Target) : "target";
             _log.Warning($"Wire intent {_activeSolve.IntentName} failed: {reason}.");
+            ReportStatusBanner(
+                wasNested ? "[Wire Cut Failed]" : $"[AutoHack Failed] {targetName}",
+                $"Reason: {reason}",
+                isError: true,
+                duration: 6f);
+        }
         _activeSolve = null;
+        _phaseRetryTimer = 0f;
         if (!wasNested)
             _itemUtility.StowActiveTrackedItem();
+    }
+
+    public bool TryGetHudStatus(
+        out string header,
+        out string detail,
+        out string? subDetail,
+        out float progress,
+        out bool isError,
+        out bool isComplete,
+        out EntityUid? targetUid)
+    {
+        header = string.Empty;
+        detail = string.Empty;
+        subDetail = null;
+        progress = 0f;
+        isError = false;
+        isComplete = false;
+        targetUid = null;
+
+        if (_activeSolve != null && !_activeSolve.NestedFromConstruction)
+        {
+            var solve = _activeSolve;
+            targetUid = solve.Target;
+            var targetName = Exists(solve.Target) ? Name(solve.Target) : "target";
+
+            if (solve.RemovingSecurity)
+            {
+                header = $"[AutoHack] {targetName} — Bypassing Panel Security";
+                detail = _construction.GetActiveStepHudSummary() ?? "Removing wire panel shielding...";
+                subDetail = $"Intent: {solve.IntentName} | Elapsed: {solve.Elapsed:0.0}s / {SolveTimeoutSeconds:0}s";
+                progress = _construction.GetActiveStepProgress();
+                return true;
+            }
+
+            if (solve.Discovery != null)
+            {
+                header = $"[AutoHack] {targetName} — Discovering Wires";
+                int attempted = solve.Discovery.Attempted.Count;
+                int totalWires = _states.TryGetValue(solve.Target, out var st) ? Math.Max(1, st.WiresList.Length) : 6;
+                var wireActionDesc = solve.Discovery.Restoring ? "Restoring probed wire" : $"Probing wire {(solve.Discovery.Wire?.Id ?? 0) + 1}";
+                detail = $"{wireActionDesc} ({attempted}/{totalWires} wires checked)";
+                subDetail = $"Intent: {solve.IntentName} | Elapsed: {solve.Elapsed:0.0}s / {SolveTimeoutSeconds:0}s";
+                progress = Math.Clamp((float)attempted / totalWires, 0.08f, 0.9f);
+                return true;
+            }
+
+            header = $"[AutoHack] {targetName} ({(solve.Unbolting ? $"Unbolting -> {solve.IntentName}" : solve.IntentName)})";
+            detail = DescribeCurrentSolvePhase(solve);
+            subDetail = $"Elapsed: {solve.Elapsed:0.0}s / {SolveTimeoutSeconds:0}s";
+
+            if (solve.Plan != null && solve.Plan.Actions.Count > 0)
+            {
+                progress = Math.Clamp((float)(solve.ActionIndex + 1) / (solve.Plan.Actions.Count + 1), 0.15f, 0.95f);
+            }
+            else
+            {
+                progress = solve.Phase switch
+                {
+                    SolvePhase.OpenPanel or SolvePhase.WaitPanelOpen => 0.1f,
+                    SolvePhase.OpenWireUi or SolvePhase.WaitWireUi => 0.2f,
+                    _ => 0.35f
+                };
+            }
+
+            return true;
+        }
+
+        if (_hudBannerTimer > 0f && !string.IsNullOrEmpty(_hudBannerHeader))
+        {
+            header = _hudBannerHeader!;
+            detail = _hudBannerDetail ?? string.Empty;
+            isError = _hudBannerIsError;
+            isComplete = !_hudBannerIsError;
+            progress = 1f;
+            return true;
+        }
+
+        return false;
+    }
+
+    private string DescribeCurrentSolvePhase(ActiveSolve solve)
+    {
+        return solve.Phase switch
+        {
+            SolvePhase.OpenPanel => "Equipping Screwdriver & opening wire panel...",
+            SolvePhase.WaitPanelOpen => "Waiting for wire panel to open...",
+            SolvePhase.OpenWireUi => solve.RemovingSecurity
+                ? (_construction.GetActiveStepHudSummary() ?? "Removing panel security...")
+                : "Equipping Wirecutters/Multitool & opening wire UI...",
+            SolvePhase.WaitWireUi => "Waiting for server wire UI state...",
+            SolvePhase.ExecuteAction or SolvePhase.WaitForAction => DescribeActiveWireAction(solve),
+            SolvePhase.WaitForTargetTool => DescribeActiveTargetTool(solve),
+            _ => solve.Phase.ToString()
+        };
+    }
+
+    private static string DescribeActiveWireAction(ActiveSolve solve)
+    {
+        if (solve.Plan == null || solve.ActionIndex < 0 || solve.ActionIndex >= solve.Plan.Actions.Count)
+            return "Finalizing wire actions...";
+
+        var step = solve.Plan.Actions[solve.ActionIndex];
+        if (step is SolvedWiresAction wireAct)
+        {
+            var wireLabel = !string.IsNullOrEmpty(wireAct.WireName)
+                ? $"wire #{wireAct.WireId + 1} ({wireAct.WireName})"
+                : $"wire #{wireAct.WireId + 1}";
+            return $"Step {solve.ActionIndex + 1}/{solve.Plan.Actions.Count}: {wireAct.Action} {wireLabel} ({wireAct.ToolQuality})";
+        }
+
+        if (step is SolvedTargetToolAction toolAct)
+        {
+            return $"Step {solve.ActionIndex + 1}/{solve.Plan.Actions.Count}: Use {toolAct.ToolQuality} tool (-> {toolAct.ExpectedState})";
+        }
+
+        return $"Step {solve.ActionIndex + 1}/{solve.Plan.Actions.Count}";
+    }
+
+    private static string DescribeActiveTargetTool(ActiveSolve solve)
+    {
+        if (solve.Plan != null &&
+            solve.ActionIndex >= 0 &&
+            solve.ActionIndex < solve.Plan.Actions.Count &&
+            solve.Plan.Actions[solve.ActionIndex] is SolvedTargetToolAction toolAct)
+        {
+            return $"Waiting for {toolAct.ToolQuality} tool to reach state '{toolAct.ExpectedState}'...";
+        }
+
+        return "Waiting for target tool action to complete...";
     }
 
     private bool IsPlayerInActiveDoAfter(EntityUid player)

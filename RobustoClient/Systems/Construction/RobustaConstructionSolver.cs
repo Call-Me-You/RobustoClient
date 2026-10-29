@@ -728,13 +728,29 @@ public sealed class RobustaConstructionSolver : EntitySystem
                 ConvertEdgeSteps(edge, GetNodeName(toNode), steps);
             }
             finalBuiltNode = edgePath[^1].To;
+            AppendPostBuildPipeAnchorStepIfNeeded(target, graph, finalBuiltNode, steps);
         }
-        else if (!IsPipeOrAtmosGraphOrNode(graph, currentNode, target))
+        else
         {
-            return null;
-        }
+            // No graph edge path exists between currentNodeName and targetNodeName.
+            // Only allow post-build anchor/screwdriver steps if the entity is on the same base node
+            // and is either unanchored or is a contraption that can change layer via Screwdriver.
+            if (!IsPipeOrAtmosGraphOrNode(graph, currentNode, target))
+                return null;
 
-        AppendPostBuildPipeAnchorStepIfNeeded(target, graph, finalBuiltNode, steps);
+            TryExtractPipeLayerSuffix(currentNodeName, out var baseCurNode, out _);
+            TryExtractPipeLayerSuffix(targetNodeName, out var baseTargetNode, out _);
+            if (!string.Equals(baseCurNode, baseTargetNode, StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            bool isTargetAnchored = _entMan.GetComponent<TransformComponent>(target).Anchored;
+            bool canScrewdriver = ShouldUseScrewdriverForPipeLayer(graph, currentNode, desiredEntityProtoId);
+            if (!canScrewdriver && isTargetAnchored)
+                return null;
+
+            if (!isTargetAnchored)
+                AppendPostBuildPipeAnchorStepIfNeeded(target, graph, finalBuiltNode, steps);
+        }
 
         if (ShouldUseScrewdriverForPipeLayer(graph, finalBuiltNode, desiredEntityProtoId) &&
             !string.IsNullOrEmpty(desiredEntityProtoId))

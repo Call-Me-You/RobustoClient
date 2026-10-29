@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Numerics;
 using System.Reflection;
 using HarmonyLib;
 using Content.Client.Construction;
@@ -21,7 +22,9 @@ using Content.Shared.Wires;
 using Robust.Client.Graphics;
 using Robust.Client.Input;
 using Robust.Client.Player;
+using Robust.Client.ResourceManagement;
 using Robust.Shared.Containers;
+using Robust.Shared.Enums;
 using Robust.Shared.GameObjects;
 using Robust.Shared.IoC;
 using Robust.Shared.Log;
@@ -49,6 +52,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     [Dependency] private readonly SharedContainerSystem _container = default!;
     [Dependency] private readonly SharedToolSystem _toolSystem = default!;
     [Dependency] private readonly TagSystem _tagSystem = default!;
+    [Dependency] private readonly IOverlayManager _overlay = default!;
     [Dependency] private readonly ItemUtilitySystem _itemUtil = default!;
     [Dependency] private readonly RobustaConstructionSolver _solver = default!;
     [Dependency] private readonly ConstructionSystem _clientConstruction = default!;
@@ -56,16 +60,24 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
     private ISawmill _log = default!;
 
+    private const int CheckFrameInterval = 5;
+    private const float JobTimeoutSeconds = 60f;
     private const float MaxInteractRange = 2.5f;
     private const float BlueprintBuildInteractRange = 1.55f;
     private const float SettleDelay = 0.25f;
-    private const float TargetRescanTimeout = 2.5f;
+    private const float TargetRescanTimeout = 60f;
     private const float DoubleTapOrHoldWindow = 0.25f;
+    private const float StepRetryInterval = 1.15f;
 
     private bool _pendingSingleTap;
     private float _singleTapTimer;
     private bool _wasConstructKeyDown;
     private bool _wasDeconstructKeyDown;
+
+    private int _frameCheckCounter;
+    private float _frameCheckAccumulator;
+    private MapCoordinates _lastPlayerMapCoords;
+    private float _movementSettleTimer;
 
     private enum StepExecutionPhase
     {
@@ -79,10 +91,15 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     private int _stepIndex;
     private StepExecutionPhase _phase;
     private EntityUid _currentTarget;
+    private string _currentTargetLabel = string.Empty;
     private EntityCoordinates _targetCoordinates;
     private MapCoordinates _targetMapCoords;
+    private Direction _targetDirection = Direction.South;
+    private string? _desiredBlueprintEntityProtoId;
     private float _waitTimer;
     private float _rescanTimer;
+    private float _stepTotalElapsed;
+    private float _currentTaskElapsed;
     private bool _wasInDoAfter;
     private EntityUid? _litWelderUid;
     private EntityUid _stepStartTarget;
@@ -99,6 +116,17 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     private float _postDoAfterTimer;
     private bool _delegatedWireSolveStarted;
     private readonly HashSet<EntityUid> _preExistingTileEntities = new();
+
+    private string? _activeBlueprintName;
+    private int _totalBlueprintTasksQueued;
+    private int _completedBlueprintTasksCount;
+    private (EntityUid GridUid, Vector2i Tile, Direction Dir, BlueprintItemEntry Item)? _activeBlueprintTask;
+    private string? _currentDiagnosticStatus;
+
+    private string? _hudBannerHeader;
+    private string? _hudBannerDetail;
+    private bool _hudBannerIsError;
+    private float _hudBannerTimer;
 
     private readonly List<(EntityUid GridUid, Vector2i Tile, Direction Dir, BlueprintItemEntry Item)> _blueprintQueue = new();
     public IReadOnlyList<(EntityUid GridUid, Vector2i Tile, Direction Dir, BlueprintItemEntry Item)> PendingBlueprintTasks => _blueprintQueue;
@@ -125,6 +153,15 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     {
         base.Initialize();
         _log = Logger.GetSawmill("robusta.autoconstruct");
+        if (!_overlay.HasOverlay<RobustaConstructHackHudOverlay>())
+            _overlay.AddOverlay(new RobustaConstructHackHudOverlay());
+    }
+
+    public override void Shutdown()
+    {
+        base.Shutdown();
+        if (_overlay.HasOverlay<RobustaConstructHackHudOverlay>())
+            _overlay.RemoveOverlay<RobustaConstructHackHudOverlay>();
     }
 
     public void HandleConstructKeyTap()
@@ -184,7 +221,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         if (_activePlan != null || _blueprintQueue.Count > 0)
         {
             _log.Info("Aborting active AutoConstruct job.");
-            StopJob();
+            StopJob("Aborted by user.");
             return;
         }
 
@@ -202,10 +239,20 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         if (playerMapCoords.MapId != cursorMapCoords.MapId)
             return;
 
-        var target = FindTargetAtCursor(player, cursorMapCoords);
+        var target = FindTargetAtCursor(player, cursorMapCoords, out var outOfRangeTarget, out float outOfRangeDist);
         if (target == null || !Exists(target.Value))
         {
-            _log.Info("No constructible or deconstructible entity found at cursor.");
+            if (outOfRangeTarget.HasValue && Exists(outOfRangeTarget.Value))
+            {
+                var rangeMsg = $"Target '{GetEntityDisplayName(outOfRangeTarget.Value)}' is out of range ({outOfRangeDist:0.1}m > {MaxInteractRange:0.1}m) — move closer.";
+                _log.Info(rangeMsg);
+                SetHudBanner("[AutoConstruct]", rangeMsg, isError: true, duration: 4.5f);
+            }
+            else
+            {
+                _log.Info("No constructible or deconstructible entity found at cursor.");
+                SetHudBanner("[AutoConstruct]", "No constructible or deconstructible entity found at cursor.", isError: true, duration: 3.5f);
+            }
             return;
         }
 
@@ -232,14 +279,22 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
         if (plan == null || plan.Steps.Count == 0)
         {
+            var modeLabel = forceDeconstruct == true ? "deconstruction" : "construction";
+            var targetLabel = GetEntityDisplayName(target.Value);
             _log.Warning($"Could not solve construction plan for {ToPrettyString(target.Value)}.");
+            SetHudBanner("[AutoConstruct Failed]", $"Could not solve {modeLabel} plan for '{targetLabel}'.", isError: true, duration: 5f);
             return;
         }
 
         StartJob(target.Value, plan);
     }
 
-    public void StartJob(EntityUid target, SolvedConstructionPlan plan)
+    public void StartJob(
+        EntityUid target,
+        SolvedConstructionPlan plan,
+        bool resetTaskTimer = true,
+        string? desiredEntityProtoId = null,
+        Direction? targetDir = null)
     {
         if (!Exists(target) || plan.Steps.Count == 0)
             return;
@@ -248,8 +303,13 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         _stepIndex = 0;
         _phase = StepExecutionPhase.PrepareAndEquip;
         _currentTarget = target;
+        _currentTargetLabel = !string.IsNullOrEmpty(desiredEntityProtoId)
+            ? desiredEntityProtoId
+            : GetEntityDisplayName(target);
+        _desiredBlueprintEntityProtoId = desiredEntityProtoId;
         _targetCoordinates = Transform(target).Coordinates;
         _targetMapCoords = _transform.GetMapCoordinates(target);
+        _targetDirection = targetDir ?? Transform(target).LocalRotation.GetCardinalDir();
         _preExistingTileEntities.Clear();
         if (_targetMapCoords.MapId != MapId.Nullspace)
         {
@@ -261,6 +321,11 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         }
         _waitTimer = 0f;
         _rescanTimer = 0f;
+        _stepTotalElapsed = 0f;
+        if (resetTaskTimer)
+            _currentTaskElapsed = 0f;
+        _currentDiagnosticStatus = null;
+        _hudBannerTimer = 0f;
         _wasInDoAfter = false;
         _stepRetryCount = 0;
         _equipRetryCount = 0;
@@ -275,13 +340,47 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                   $"({plan.GraphId}: {plan.StartNode} -> {plan.TargetNode}, {plan.Steps.Count} steps).");
     }
 
-    public void StopJob()
+    public void StopJob(string? reason = null)
     {
+        bool hadActiveWork = _activePlan != null || _blueprintQueue.Count > 0;
         _blueprintQueue.Clear();
-        FinishCurrentPlan(cancelled: true);
+        _activeBlueprintTask = null;
+        _activeBlueprintName = null;
+        _totalBlueprintTasksQueued = 0;
+        _completedBlueprintTasksCount = 0;
+        _currentTaskElapsed = 0f;
+        FinishCurrentPlan(cancelled: true, clearGhost: true);
+        if (hadActiveWork && !string.IsNullOrEmpty(reason))
+            SetHudBanner("[AutoConstruct Stopped]", reason, isError: false, duration: 3f);
     }
 
-    private void FinishCurrentPlan(bool cancelled = false)
+    private void FailBlueprintOrJob(string reason)
+    {
+        bool wasBlueprint = _blueprintQueue.Count > 0 || _activeBlueprintTask != null;
+        var modeTitle = wasBlueprint
+            ? $"[Blueprint Build Failed] {_activeBlueprintName ?? "Blueprint"}"
+            : (_activePlan?.IsDeconstruct == true ? "[AutoDeconstruct Failed]" : $"[AutoBuild Failed] {_currentTargetLabel}");
+
+        _log.Warning($"{modeTitle}: {reason}");
+        _blueprintQueue.Clear();
+        _activeBlueprintTask = null;
+        _activeBlueprintName = null;
+        _totalBlueprintTasksQueued = 0;
+        _completedBlueprintTasksCount = 0;
+        _currentTaskElapsed = 0f;
+        FinishCurrentPlan(cancelled: true, clearGhost: true);
+        SetHudBanner(modeTitle, reason, isError: true, duration: 6.5f);
+    }
+
+    public void SetHudBanner(string header, string detail, bool isError, float duration = 5f)
+    {
+        _hudBannerHeader = header;
+        _hudBannerDetail = detail;
+        _hudBannerIsError = isError;
+        _hudBannerTimer = duration;
+    }
+
+    private void FinishCurrentPlan(bool cancelled = false, bool clearGhost = false)
     {
         _itemUtil.CancelAll();
         ExtinguishActiveWelderIfNeeded();
@@ -290,7 +389,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             _itemUtil.StowActiveTrackedItem();
         }
 
-        if (Exists(_currentTarget) && HasGhostComponent(_currentTarget))
+        if ((cancelled || clearGhost || _blueprintQueue.Count == 0) &&
+            Exists(_currentTarget) && HasGhostComponent(_currentTarget))
         {
             ClearGhostEntity(_currentTarget);
         }
@@ -300,8 +400,10 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         _stepIndex = 0;
         _phase = StepExecutionPhase.PrepareAndEquip;
         _currentTarget = EntityUid.Invalid;
+        _currentDiagnosticStatus = null;
         _waitTimer = 0f;
         _rescanTimer = 0f;
+        _stepTotalElapsed = 0f;
         _wasInDoAfter = false;
         _stepStartTarget = EntityUid.Invalid;
         _stepStartNode = null;
@@ -341,6 +443,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             if (foundGrid == null || !TryComp(foundGrid.Value, out grid))
             {
                 _log.Warning("Cannot start phased blueprint build: target coordinates are not on a valid grid.");
+                SetHudBanner("[Blueprint Build Failed]", "Target coordinates are not on a valid grid.", isError: true, duration: 5f);
                 return;
             }
             gridUid = foundGrid.Value;
@@ -388,12 +491,23 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             return a.Item.LayerOrder.CompareTo(b.Item.LayerOrder);
         });
 
+        _activeBlueprintName = blueprint.Name;
+        _totalBlueprintTasksQueued = _blueprintQueue.Count;
+        _completedBlueprintTasksCount = 0;
+        _activeBlueprintTask = null;
+        _currentTaskElapsed = 0f;
+        _currentDiagnosticStatus = null;
+        _hudBannerTimer = 0f;
+
         _log.Info($"Queued {added} phased blueprint build tasks for '{blueprint.Name}' (Phase filter: {onlyPhase?.ToString() ?? "All"}).");
     }
 
     public override void FrameUpdate(float frameTime)
     {
         base.FrameUpdate(frameTime);
+
+        if (_hudBannerTimer > 0f)
+            _hudBannerTimer = Math.Max(0f, _hudBannerTimer - frameTime);
 
         if (!_input.IsKeyDown(RobustaConfig.AutoConstructKey))
             _wasConstructKeyDown = false;
@@ -416,7 +530,11 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         }
 
         if (_activePlan == null && _blueprintQueue.Count == 0)
+        {
+            _frameCheckCounter = 0;
+            _frameCheckAccumulator = 0f;
             return;
+        }
 
         if (_player.LocalEntity is not { } player || !Exists(player))
         {
@@ -426,18 +544,48 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
         _solver.NoteHeldEntity(_hands.GetActiveItem(player));
 
-        // Check DoAfter state BEFORE _itemUtil.IsBusy so short DoAfters starting during post-click delay are never missed
+        // Observe DoAfter state every frame so fast DoAfters starting/finishing between 5-frame ticks are never missed
         if (IsPlayerInActiveDoAfter(player))
         {
             _wasInDoAfter = true;
             _sawDoAfterForStep = true;
+            _lastPlayerMapCoords = _transform.GetMapCoordinates(player);
             return;
+        }
+
+        // Check every frame if the player is actively moving so we never start a DoAfter or split/drop materials mid-walk
+        if (IsPlayerMoving(player))
+        {
+            _movementSettleTimer = 0.22f;
+            _currentDiagnosticStatus = "Paused: Waiting for player to stop moving...";
+            return;
+        }
+
+        if (_movementSettleTimer > 0f)
+        {
+            _movementSettleTimer = Math.Max(0f, _movementSettleTimer - frameTime);
+            return;
+        }
+
+        _frameCheckAccumulator += frameTime;
+        _frameCheckCounter++;
+        if (_frameCheckCounter < CheckFrameInterval)
+            return;
+
+        float stepDt = _frameCheckAccumulator;
+        _frameCheckAccumulator = 0f;
+        _frameCheckCounter = 0;
+
+        if (_activePlan != null)
+        {
+            _stepTotalElapsed += stepDt;
+            _currentTaskElapsed += stepDt;
         }
 
         if (_wasInDoAfter)
         {
             _wasInDoAfter = false;
-            _waitTimer = Math.Max(_waitTimer, 0.35f);
+            _waitTimer = Math.Max(_waitTimer, 0.3f);
         }
 
         if (_itemUtil.IsBusy)
@@ -445,28 +593,27 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
         if (_waitTimer > 0f)
         {
-            _waitTimer -= frameTime;
+            _waitTimer -= stepDt;
             return;
         }
 
         if (_activePlan == null)
         {
-            ProcessNextQueuedBlueprintTask(player);
+            ProcessNextQueuedBlueprintTask(player, stepDt);
             return;
         }
 
-        ExecuteCurrentStep(player, frameTime);
+        ExecuteCurrentStep(player, stepDt);
     }
 
-    private void ProcessNextQueuedBlueprintTask(EntityUid player)
+    private void ProcessNextQueuedBlueprintTask(EntityUid player, float dt)
     {
         var playerMapCoords = _transform.GetMapCoordinates(player);
 
-        while (_blueprintQueue.Count > 0)
+        // 1. Prune invalid grids or verified-completed items in the current earliest effective phase
+        if (_blueprintQueue.Count > 0)
         {
-            // Prune invalid grids or already-built items in the current earliest effective phase
             var minPhase = _blueprintQueue.Min(t => GetEffectiveBlueprintPhase(t.Item));
-            bool prunedAny = false;
 
             for (int i = _blueprintQueue.Count - 1; i >= 0; i--)
             {
@@ -477,61 +624,6 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 if (!Exists(candidate.GridUid) || !TryComp<MapGridComponent>(candidate.GridUid, out var cGrid))
                 {
                     _blueprintQueue.RemoveAt(i);
-                    prunedAny = true;
-                    continue;
-                }
-
-                var cCoords = _mapSystem.GridTileToLocal(candidate.GridUid, cGrid, candidate.Tile);
-                var cMap = _transform.ToMapCoordinates(cCoords);
-                if (cMap.MapId != playerMapCoords.MapId ||
-                    IsBlueprintItemAlreadySatisfied(cMap, candidate.Item, candidate.Dir))
-                {
-                    _blueprintQueue.RemoveAt(i);
-                    prunedAny = true;
-                }
-            }
-
-            if (_blueprintQueue.Count == 0)
-                return;
-
-            if (prunedAny)
-                minPhase = _blueprintQueue.Min(t => GetEffectiveBlueprintPhase(t.Item));
-
-            // Determine the earliest sub-priority still queued on each tile so a pipe (SubPriority 2)
-            // is NEVER built on a tile while a filter/mixer/pump/port/vent (SubPriority 1) is still queued on that tile.
-            var minSubPriorityPerTile = new Dictionary<(EntityUid GridUid, Vector2i Tile), int>();
-            foreach (var entry in _blueprintQueue)
-            {
-                if (GetEffectiveBlueprintPhase(entry.Item) != minPhase)
-                    continue;
-
-                var key = (entry.GridUid, entry.Tile);
-                int sub = GetEffectiveBlueprintSubPriority(entry.Item);
-                if (!minSubPriorityPerTile.TryGetValue(key, out int curMin) || sub < curMin)
-                    minSubPriorityPerTile[key] = sub;
-            }
-
-            // Pick the best in-range task in minPhase:
-            // 1. Must be at the earliest pending SubPriority for its tile (so contraptions on a tile ALWAYS build before pipes on that tile)
-            // 2. Prefer lower SubPriority (all in-range contraptions before in-range pipes), then nearest distance
-            int bestIdx = -1;
-            int bestSubPriority = int.MaxValue;
-            float bestDist = float.MaxValue;
-            int bestLayerOrder = int.MaxValue;
-
-            for (int i = 0; i < _blueprintQueue.Count; i++)
-            {
-                var candidate = _blueprintQueue[i];
-                if (GetEffectiveBlueprintPhase(candidate.Item) != minPhase ||
-                    !Exists(candidate.GridUid) ||
-                    !TryComp<MapGridComponent>(candidate.GridUid, out var cGrid))
-                    continue;
-
-                int subPriority = GetEffectiveBlueprintSubPriority(candidate.Item);
-                if (minSubPriorityPerTile.TryGetValue((candidate.GridUid, candidate.Tile), out int tileMinSub) &&
-                    subPriority > tileMinSub)
-                {
-                    // Hold off on pipes on this tile until the contraption(s) on this tile are built first
                     continue;
                 }
 
@@ -540,86 +632,240 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 if (cMap.MapId != playerMapCoords.MapId)
                     continue;
 
-                float d = (cMap.Position - playerMapCoords.Position).Length();
-                if (d > BlueprintBuildInteractRange)
-                    continue;
-
-                if (subPriority < bestSubPriority ||
-                    (subPriority == bestSubPriority && d < bestDist - 0.05f) ||
-                    (subPriority == bestSubPriority && MathF.Abs(d - bestDist) <= 0.05f && candidate.Item.LayerOrder < bestLayerOrder))
+                if (IsBlueprintItemAlreadySatisfied(cMap, candidate.Item, candidate.Dir, candidate.GridUid, cGrid, candidate.Tile))
                 {
-                    bestSubPriority = subPriority;
-                    bestDist = d;
-                    bestLayerOrder = candidate.Item.LayerOrder;
-                    bestIdx = i;
-                }
-            }
-
-            // If no eligible task in this phase is within SS14's construction interaction range,
-            // keep remaining tasks in the queue (and visible on the overlay) until the player steps closer.
-            if (bestIdx < 0)
-                return;
-
-            var task = _blueprintQueue[bestIdx];
-            _blueprintQueue.RemoveAt(bestIdx);
-
-            var grid = Comp<MapGridComponent>(task.GridUid);
-            var tileCoords = _mapSystem.GridTileToLocal(task.GridUid, grid, task.Tile);
-            var tileMapCoords = _transform.ToMapCoordinates(tileCoords);
-
-            // 1. Direct stack placement (Cables, Floor Tiles, Rods/Lattice)
-            if (TryExecuteDirectStackBlueprintItem(task.Item, tileCoords))
-            {
-                _waitTimer = SettleDelay;
-                return;
-            }
-
-            var recipeId = task.Item.ConstructionPrototypeId;
-            var resolvedFromEntity = _solver.ResolveConstructionPrototypeForEntity(task.Item.EntityPrototypeId);
-            if (string.IsNullOrEmpty(recipeId) || !_protoMan.HasIndex<ConstructionPrototype>(recipeId))
-            {
-                recipeId = resolvedFromEntity;
-            }
-            else if (!string.IsNullOrEmpty(resolvedFromEntity) &&
-                     !string.Equals(recipeId, resolvedFromEntity, StringComparison.OrdinalIgnoreCase) &&
-                     _solver.GetDesiredPipeLayer(task.Item.EntityPrototypeId, null) > 0 &&
-                     RobustaConstructionSolver.GetPipeLayerForIdOrNode(resolvedFromEntity) > 0)
-            {
-                recipeId = resolvedFromEntity;
-            }
-
-            // 2. Existing unfinished frame or matching ghost on the tile (clearing any mismatched ghosts)
-            var existingFrameOrGhost = FindMatchingFrameOrGhostOnTile(tileMapCoords, task.Item, task.Dir, recipeId);
-            if (existingFrameOrGhost != null && Exists(existingFrameOrGhost.Value))
-            {
-                var existingPlan = _solver.SolveBuildPlan(existingFrameOrGhost.Value, task.Item.EntityPrototypeId);
-                if (existingPlan != null && existingPlan.Steps.Count > 0)
-                {
-                    StartJob(existingFrameOrGhost.Value, existingPlan);
-                    return;
-                }
-            }
-
-            // 3. Ensure no leftover ghost is occupying the tile, then spawn this item's construction ghost on-demand
-            ClearGhostsOnTile(tileMapCoords);
-
-            if (!string.IsNullOrEmpty(recipeId) &&
-                _protoMan.TryIndex<ConstructionPrototype>(recipeId, out var cProto) &&
-                cProto.Type == ConstructionType.Structure)
-            {
-                if (_clientConstruction.TrySpawnGhost(cProto, tileCoords, task.Dir, out var ghostUid) &&
-                    ghostUid != null && Exists(ghostUid.Value))
-                {
-                    var ghostPlan = _solver.SolveBuildPlan(cProto, includeGhostStart: true, desiredEntityProtoId: task.Item.EntityPrototypeId)
-                                    ?? _solver.SolveBuildPlan(ghostUid.Value, task.Item.EntityPrototypeId);
-                    if (ghostPlan != null && ghostPlan.Steps.Count > 0)
+                    _blueprintQueue.RemoveAt(i);
+                    _completedBlueprintTasksCount++;
+                    if (_activeBlueprintTask is { } active &&
+                        active.GridUid == candidate.GridUid &&
+                        active.Tile == candidate.Tile &&
+                        string.Equals(active.Item.EntityPrototypeId, candidate.Item.EntityPrototypeId, StringComparison.OrdinalIgnoreCase))
                     {
-                        StartJob(ghostUid.Value, ghostPlan);
-                        return;
+                        _activeBlueprintTask = null;
+                        _currentTaskElapsed = 0f;
+                        _currentDiagnosticStatus = null;
                     }
                 }
             }
         }
+
+        if (_blueprintQueue.Count == 0)
+        {
+            var bpName = _activeBlueprintName ?? "Blueprint";
+            _log.Info($"Completed all blueprint build tasks for '{bpName}'.");
+            SetHudBanner(
+                "[Blueprint Build Complete]",
+                $"Finished building '{bpName}' ({_completedBlueprintTasksCount}/{Math.Max(_completedBlueprintTasksCount, _totalBlueprintTasksQueued)} items).",
+                isError: false,
+                duration: 3.5f);
+            _activeBlueprintName = null;
+            _activeBlueprintTask = null;
+            _currentTaskElapsed = 0f;
+            _currentDiagnosticStatus = null;
+            _itemUtil.StowActiveTrackedItem();
+            return;
+        }
+
+        var currentPhase = _blueprintQueue.Min(t => GetEffectiveBlueprintPhase(t.Item));
+
+        // Determine the earliest sub-priority still queued on each tile so a pipe (SubPriority 2)
+        // is NEVER built on a tile while a filter/mixer/pump/port/vent (SubPriority 1) is still queued on that tile.
+        var minSubPriorityPerTile = new Dictionary<(EntityUid GridUid, Vector2i Tile), int>();
+        foreach (var entry in _blueprintQueue)
+        {
+            if (GetEffectiveBlueprintPhase(entry.Item) != currentPhase)
+                continue;
+
+            var key = (entry.GridUid, entry.Tile);
+            int sub = GetEffectiveBlueprintSubPriority(entry.Item);
+            if (!minSubPriorityPerTile.TryGetValue(key, out int curMin) || sub < curMin)
+                minSubPriorityPerTile[key] = sub;
+        }
+
+        int bestIdx = -1;
+        int bestSubPriority = int.MaxValue;
+        float bestDist = float.MaxValue;
+        int bestLayerOrder = int.MaxValue;
+
+        int nearestAnyIdx = -1;
+        float nearestAnyDist = float.MaxValue;
+
+        for (int i = 0; i < _blueprintQueue.Count; i++)
+        {
+            var candidate = _blueprintQueue[i];
+            if (GetEffectiveBlueprintPhase(candidate.Item) != currentPhase ||
+                !Exists(candidate.GridUid) ||
+                !TryComp<MapGridComponent>(candidate.GridUid, out var cGrid))
+                continue;
+
+            int subPriority = GetEffectiveBlueprintSubPriority(candidate.Item);
+            if (minSubPriorityPerTile.TryGetValue((candidate.GridUid, candidate.Tile), out int tileMinSub) &&
+                subPriority > tileMinSub)
+            {
+                // Hold off on pipes on this tile until the contraption(s) on this tile are built first
+                continue;
+            }
+
+            var cCoords = _mapSystem.GridTileToLocal(candidate.GridUid, cGrid, candidate.Tile);
+            var cMap = _transform.ToMapCoordinates(cCoords);
+            if (cMap.MapId != playerMapCoords.MapId)
+                continue;
+
+            float d = (cMap.Position - playerMapCoords.Position).Length();
+            if (d < nearestAnyDist)
+            {
+                nearestAnyDist = d;
+                nearestAnyIdx = i;
+            }
+
+            if (d > BlueprintBuildInteractRange)
+                continue;
+
+            if (subPriority < bestSubPriority ||
+                (subPriority == bestSubPriority && d < bestDist - 0.05f) ||
+                (subPriority == bestSubPriority && MathF.Abs(d - bestDist) <= 0.05f && candidate.Item.LayerOrder < bestLayerOrder))
+            {
+                bestSubPriority = subPriority;
+                bestDist = d;
+                bestLayerOrder = candidate.Item.LayerOrder;
+                bestIdx = i;
+            }
+        }
+
+        // If no eligible task in this phase is within interaction range, inform the user on the HUD and keep rechecking up to 60s
+        if (bestIdx < 0)
+        {
+            _currentTaskElapsed += dt;
+            if (nearestAnyIdx >= 0)
+            {
+                var nearest = _blueprintQueue[nearestAnyIdx];
+                var nGrid = Comp<MapGridComponent>(nearest.GridUid);
+                _targetCoordinates = _mapSystem.GridTileToLocal(nearest.GridUid, nGrid, nearest.Tile);
+                _targetMapCoords = _transform.ToMapCoordinates(_targetCoordinates);
+                _currentDiagnosticStatus =
+                    $"Paused: Step closer to '{nearest.Item.EntityPrototypeId}' at ({nearest.Tile.X}, {nearest.Tile.Y}) ({nearestAnyDist:0.1}m > {BlueprintBuildInteractRange:0.2}m) [{_currentTaskElapsed:0}s / {JobTimeoutSeconds:0}s]";
+
+                if (_currentTaskElapsed >= JobTimeoutSeconds)
+                {
+                    FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s waiting to get in range of '{nearest.Item.EntityPrototypeId}' at tile ({nearest.Tile.X}, {nearest.Tile.Y}).");
+                }
+            }
+            return;
+        }
+
+        // Keep task in _blueprintQueue until IsBlueprintItemAlreadySatisfied confirms the structure is actually built!
+        var task = _blueprintQueue[bestIdx];
+        if (_activeBlueprintTask == null ||
+            _activeBlueprintTask.Value.GridUid != task.GridUid ||
+            _activeBlueprintTask.Value.Tile != task.Tile ||
+            !string.Equals(_activeBlueprintTask.Value.Item.EntityPrototypeId, task.Item.EntityPrototypeId, StringComparison.OrdinalIgnoreCase))
+        {
+            _activeBlueprintTask = task;
+            _currentTaskElapsed = 0f;
+            _currentDiagnosticStatus = null;
+        }
+        else
+        {
+            _currentTaskElapsed += dt;
+            if (_currentTaskElapsed >= JobTimeoutSeconds)
+            {
+                FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s trying to build '{task.Item.EntityPrototypeId}' at tile ({task.Tile.X}, {task.Tile.Y}).");
+                return;
+            }
+        }
+
+        var grid = Comp<MapGridComponent>(task.GridUid);
+        var tileCoords = _mapSystem.GridTileToLocal(task.GridUid, grid, task.Tile);
+        var tileMapCoords = _transform.ToMapCoordinates(tileCoords);
+        _targetCoordinates = tileCoords;
+        _targetMapCoords = tileMapCoords;
+
+        // 1. Direct stack placement (Cables, Floor Tiles) — stays in _blueprintQueue until verified placed on next recheck
+        if (IsDirectStackBlueprintItem(task.Item, out var stackProtoOrType, out var matId))
+        {
+            if (TryExecuteDirectStackBlueprintItem(task.Item, tileCoords))
+            {
+                _currentDiagnosticStatus = $"Placing '{task.Item.EntityPrototypeId}' at ({task.Tile.X}, {task.Tile.Y}) [{_currentTaskElapsed:0.0}s / {JobTimeoutSeconds:0}s]";
+                _waitTimer = 0.45f;
+                return;
+            }
+
+            if (_currentTaskElapsed < 0.6f)
+                TryOpenWornStorageSlots(player);
+
+            _currentDiagnosticStatus = $"Waiting for required material '{matId}' ({stackProtoOrType}) [{_currentTaskElapsed:0.0}s / {JobTimeoutSeconds:0}s]";
+            if (_currentTaskElapsed >= 4.0f)
+            {
+                FailBlueprintOrJob($"Missing required stack item '{stackProtoOrType}' ({matId}) to place '{task.Item.EntityPrototypeId}'.");
+                return;
+            }
+
+            _waitTimer = 0.45f;
+            return;
+        }
+
+        var recipeId = task.Item.ConstructionPrototypeId;
+        var resolvedFromEntity = _solver.ResolveConstructionPrototypeForEntity(task.Item.EntityPrototypeId);
+        if (string.IsNullOrEmpty(recipeId) || !_protoMan.HasIndex<ConstructionPrototype>(recipeId))
+        {
+            recipeId = resolvedFromEntity;
+        }
+        else if (!string.IsNullOrEmpty(resolvedFromEntity) &&
+                 !string.Equals(recipeId, resolvedFromEntity, StringComparison.OrdinalIgnoreCase) &&
+                 _solver.GetDesiredPipeLayer(task.Item.EntityPrototypeId, null) > 0 &&
+                 RobustaConstructionSolver.GetPipeLayerForIdOrNode(resolvedFromEntity) > 0)
+        {
+            recipeId = resolvedFromEntity;
+        }
+
+        // 2. Existing unfinished frame, unanchored/unconfigured structure, or matching ghost on the tile
+        var existingFrameOrGhost = FindMatchingFrameOrGhostOnTile(tileMapCoords, task.Item, task.Dir, recipeId);
+        if (existingFrameOrGhost != null && Exists(existingFrameOrGhost.Value))
+        {
+            var existingPlan = _solver.SolveBuildPlan(existingFrameOrGhost.Value, task.Item.EntityPrototypeId);
+            if (existingPlan != null && existingPlan.Steps.Count > 0)
+            {
+                StartJob(
+                    existingFrameOrGhost.Value,
+                    existingPlan,
+                    resetTaskTimer: false,
+                    desiredEntityProtoId: task.Item.EntityPrototypeId,
+                    targetDir: task.Dir);
+                return;
+            }
+        }
+
+        // 3. Ensure no mismatched ghost is occupying the tile, then spawn this item's construction ghost on-demand
+        ClearGhostsOnTile(tileMapCoords);
+
+        if (!string.IsNullOrEmpty(recipeId) &&
+            _protoMan.TryIndex<ConstructionPrototype>(recipeId, out var cProto) &&
+            cProto.Type == ConstructionType.Structure)
+        {
+            if (_clientConstruction.TrySpawnGhost(cProto, tileCoords, task.Dir, out var ghostUid) &&
+                ghostUid != null && Exists(ghostUid.Value))
+            {
+                var ghostPlan = _solver.SolveBuildPlan(cProto, includeGhostStart: true, desiredEntityProtoId: task.Item.EntityPrototypeId)
+                                ?? _solver.SolveBuildPlan(ghostUid.Value, task.Item.EntityPrototypeId);
+                if (ghostPlan != null && ghostPlan.Steps.Count > 0)
+                {
+                    StartJob(
+                        ghostUid.Value,
+                        ghostPlan,
+                        resetTaskTimer: false,
+                        desiredEntityProtoId: task.Item.EntityPrototypeId,
+                        targetDir: task.Dir);
+                    return;
+                }
+            }
+
+            _currentDiagnosticStatus =
+                $"Waiting to place ghost for '{task.Item.EntityPrototypeId}' at ({task.Tile.X}, {task.Tile.Y}) — rechecking tile [{_currentTaskElapsed:0.0}s / {JobTimeoutSeconds:0}s]";
+            _waitTimer = 0.5f;
+            return;
+        }
+
+        FailBlueprintOrJob($"Could not resolve a valid construction recipe for '{task.Item.EntityPrototypeId}'.");
     }
 
     private BlueprintZPhase GetEffectiveBlueprintPhase(BlueprintItemEntry item)
@@ -711,13 +957,57 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         return false;
     }
 
-    private bool IsBlueprintItemAlreadySatisfied(MapCoordinates tileMapCoords, BlueprintItemEntry item, Direction expectedDir)
+    private bool IsBlueprintItemAlreadySatisfied(
+        MapCoordinates tileMapCoords,
+        BlueprintItemEntry item,
+        Direction expectedDir,
+        EntityUid? gridUid = null,
+        MapGridComponent? grid = null,
+        Vector2i? tileIndices = null)
     {
         if (string.IsNullOrEmpty(item.EntityPrototypeId))
             return false;
 
+        var idLower = item.EntityPrototypeId.ToLowerInvariant();
+        if ((idLower.Contains("floortile") || idLower == "tileitemsteel") &&
+            gridUid.HasValue && grid != null && tileIndices.HasValue)
+        {
+            return _mapSystem.TryGetTileRef(gridUid.Value, grid, tileIndices.Value, out var tileRef) &&
+                   !tileRef.Tile.IsEmpty;
+        }
+
         var desiredBaseId = _solver.NormalizeBaseEntityPrototypeId(item.EntityPrototypeId);
         int desiredLayer = _solver.GetDesiredPipeLayer(item.EntityPrototypeId, item.ConstructionPrototypeId);
+        bool isAtmosOrPipe = desiredLayer > 0 ||
+                             IsAtmosPipeContraption(item) ||
+                             idLower.Contains("pipe") ||
+                             idLower.Contains("manifold");
+
+        bool ignoreDirection = !isAtmosOrPipe &&
+                               (desiredBaseId.Contains("Cable", StringComparison.OrdinalIgnoreCase) ||
+                                desiredBaseId.Contains("Wall", StringComparison.OrdinalIgnoreCase) ||
+                                desiredBaseId.Contains("Girder", StringComparison.OrdinalIgnoreCase) ||
+                                desiredBaseId.Contains("Grille", StringComparison.OrdinalIgnoreCase) ||
+                                desiredBaseId.Contains("Airlock", StringComparison.OrdinalIgnoreCase) ||
+                                desiredBaseId.Contains("Firelock", StringComparison.OrdinalIgnoreCase) ||
+                                desiredBaseId.Contains("Shutter", StringComparison.OrdinalIgnoreCase) ||
+                                (desiredBaseId.Contains("Window", StringComparison.OrdinalIgnoreCase) && !desiredBaseId.Contains("Directional", StringComparison.OrdinalIgnoreCase)) ||
+                                desiredBaseId.Contains("Table", StringComparison.OrdinalIgnoreCase));
+
+        string? expectedGraphId = null;
+        string? expectedTargetNode = null;
+        var recipeId = item.ConstructionPrototypeId;
+        if (string.IsNullOrEmpty(recipeId) || !_protoMan.HasIndex<ConstructionPrototype>(recipeId))
+            recipeId = _solver.ResolveConstructionPrototypeForEntity(item.EntityPrototypeId);
+
+        if (!string.IsNullOrEmpty(recipeId) &&
+            _protoMan.TryIndex<ConstructionPrototype>(recipeId, out var cProto))
+        {
+            expectedGraphId = GetStringMember(cProto, "Graph");
+            expectedTargetNode = GetStringMember(cProto, "TargetNode");
+            if (GetMemberValue(cProto, "CanRotate") is false)
+                ignoreDirection = true;
+        }
 
         var entities = _lookup.GetEntitiesInRange(tileMapCoords, 0.35f, LookupFlags.Uncontained);
         foreach (var uid in entities)
@@ -725,27 +1015,52 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             if (!Exists(uid) || Deleted(uid) || HasGhostComponent(uid))
                 continue;
 
+            var xform = Transform(uid);
+            if (!xform.Anchored)
+                continue;
+
+            if (GetBoolMember(xform, "NoRot"))
+                ignoreDirection = true;
+
             var protoId = MetaData(uid).EntityPrototype?.ID;
             if (string.IsNullOrEmpty(protoId))
                 continue;
 
             var entBaseId = _solver.NormalizeBaseEntityPrototypeId(protoId);
-            if (!string.Equals(protoId, item.EntityPrototypeId, StringComparison.OrdinalIgnoreCase) &&
-                !string.Equals(entBaseId, desiredBaseId, StringComparison.OrdinalIgnoreCase))
+            bool protoMatched = string.Equals(protoId, item.EntityPrototypeId, StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(entBaseId, desiredBaseId, StringComparison.OrdinalIgnoreCase);
+
+            // Also match board-constructed Airlocks (e.g. Airlock built from any DoorElectronics) or completed graph target nodes
+            if (!protoMatched &&
+                !isAtmosOrPipe &&
+                !IsGhostOrUnfinishedFrame(uid) &&
+                !string.IsNullOrEmpty(expectedGraphId) &&
+                _solver.TryResolveGraphAndNode(uid, out var uGraph, out var uNode, out _) &&
+                uGraph != null && uNode != null &&
+                string.Equals(uGraph.ID, expectedGraphId, StringComparison.OrdinalIgnoreCase))
             {
-                continue;
+                if (string.Equals(expectedGraphId, "Airlock", StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrEmpty(expectedTargetNode) &&
+                     string.Equals(uNode.Name, expectedTargetNode, StringComparison.OrdinalIgnoreCase)))
+                {
+                    protoMatched = true;
+                }
             }
 
-            var xform = Transform(uid);
-            if (!xform.Anchored)
+            if (!protoMatched)
                 continue;
 
-            if (xform.LocalRotation.GetCardinalDir() != expectedDir)
+            if (!ignoreDirection && xform.LocalRotation.GetCardinalDir() != expectedDir)
                 continue;
 
-            int actualLayer = _solver.DetectEntityPipeLayer(uid, out _);
-            if (actualLayer == desiredLayer)
-                return true;
+            if (isAtmosOrPipe)
+            {
+                int actualLayer = _solver.DetectEntityPipeLayer(uid, out _);
+                if (actualLayer != desiredLayer)
+                    continue;
+            }
+
+            return true;
         }
 
         return false;
@@ -759,6 +1074,10 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
     {
         var entities = _lookup.GetEntitiesInRange(tileMapCoords, 0.35f, LookupFlags.Uncontained).ToList();
         EntityUid? matchedGhost = null;
+        EntityUid? unanchoredOrWrongLayerMatch = null;
+
+        var desiredBaseId = _solver.NormalizeBaseEntityPrototypeId(item.EntityPrototypeId ?? string.Empty);
+        int desiredLayer = _solver.GetDesiredPipeLayer(item.EntityPrototypeId, item.ConstructionPrototypeId);
 
         foreach (var uid in entities)
         {
@@ -787,6 +1106,32 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 continue;
             }
 
+            // Only match an existing non-ghost pipe/contraption if it is UNANCHORED (still being built on this tile).
+            // An already-anchored structure on another layer belongs to that other layer's blueprint entry and must NEVER be reused!
+            var xform = Transform(uid);
+            if (!xform.Anchored)
+            {
+                var protoId = MetaData(uid).EntityPrototype?.ID ?? string.Empty;
+                if (!string.IsNullOrEmpty(protoId) && !string.IsNullOrEmpty(desiredBaseId))
+                {
+                    var entBaseId = _solver.NormalizeBaseEntityPrototypeId(protoId);
+                    bool isContraption = IsAtmosPipeContraption(item);
+                    bool protoMatches = isContraption
+                        ? (string.Equals(protoId, item.EntityPrototypeId, StringComparison.OrdinalIgnoreCase) ||
+                           string.Equals(entBaseId, desiredBaseId, StringComparison.OrdinalIgnoreCase))
+                        : string.Equals(protoId, item.EntityPrototypeId, StringComparison.OrdinalIgnoreCase);
+
+                    if (protoMatches && xform.LocalRotation.GetCardinalDir() == expectedDir)
+                    {
+                        int actualLayer = _solver.DetectEntityPipeLayer(uid, out _);
+                        if (actualLayer == desiredLayer || isContraption)
+                        {
+                            unanchoredOrWrongLayerMatch = uid;
+                        }
+                    }
+                }
+            }
+
             if (IsGhostOrUnfinishedFrame(uid) &&
                 _solver.TryResolveGraphAndNode(uid, out var frameGraph, out _, out _) &&
                 frameGraph != null)
@@ -802,7 +1147,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             }
         }
 
-        return matchedGhost;
+        return unanchoredOrWrongLayerMatch ?? matchedGhost;
     }
 
     private void ClearGhostsOnTile(MapCoordinates tileMapCoords)
@@ -839,35 +1184,50 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         }
     }
 
-    private bool TryExecuteDirectStackBlueprintItem(BlueprintItemEntry item, EntityCoordinates tileCoords)
+    private static bool IsDirectStackBlueprintItem(
+        BlueprintItemEntry item,
+        out string? stackProtoOrType,
+        out string? matId)
     {
+        stackProtoOrType = null;
+        matId = null;
         var idLower = (item.EntityPrototypeId ?? string.Empty).ToLowerInvariant();
-        string? stackProtoOrType = null;
-        string? matId = null;
 
         if (idLower.Contains("cablehv"))
         {
             stackProtoOrType = "CableHVStack";
             matId = "CableHV";
+            return true;
         }
-        else if (idLower.Contains("cablemv"))
+        if (idLower.Contains("cablemv"))
         {
             stackProtoOrType = "CableMVStack";
             matId = "CableMV";
+            return true;
         }
-        else if (idLower.Contains("cableapc"))
+        if (idLower.Contains("cableapc"))
         {
             stackProtoOrType = "CableApcExtensionStack";
             matId = "Cable";
+            return true;
         }
-        else if (idLower.Contains("floortile") || idLower == "tileitemsteel")
+        if (idLower.Contains("floortile") || idLower == "tileitemsteel")
         {
             stackProtoOrType = "FloorTileItemSteel";
             matId = "FloorTile";
+            return true;
         }
 
-        if (string.IsNullOrEmpty(stackProtoOrType) || string.IsNullOrEmpty(matId))
+        return false;
+    }
+
+    private bool TryExecuteDirectStackBlueprintItem(BlueprintItemEntry item, EntityCoordinates tileCoords)
+    {
+        if (!IsDirectStackBlueprintItem(item, out var stackProtoOrType, out var matId) ||
+            string.IsNullOrEmpty(stackProtoOrType) || string.IsNullOrEmpty(matId))
+        {
             return false;
+        }
 
         bool equipped = _itemUtil.TryEquipItem(stackProtoOrType, 1) ||
                         _itemUtil.TryEquipByPredicate(
@@ -884,6 +1244,64 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         return true;
     }
 
+    private void CompleteActivePlan()
+    {
+        if (_activePlan == null)
+            return;
+
+        bool wasDeconstruct = _activePlan.IsDeconstruct;
+        var graphId = _activePlan.GraphId;
+        var startNode = _activePlan.StartNode;
+        var targetNode = _activePlan.TargetNode;
+        var label = _currentTargetLabel;
+
+        if (_blueprintQueue.Count > 0 && _activeBlueprintTask is { } bpTask &&
+            Exists(bpTask.GridUid) && TryComp<MapGridComponent>(bpTask.GridUid, out var bpGrid))
+        {
+            var bpMap = _transform.ToMapCoordinates(_mapSystem.GridTileToLocal(bpTask.GridUid, bpGrid, bpTask.Tile));
+            if (IsBlueprintItemAlreadySatisfied(bpMap, bpTask.Item, bpTask.Dir, bpTask.GridUid, bpGrid, bpTask.Tile))
+            {
+                for (int i = _blueprintQueue.Count - 1; i >= 0; i--)
+                {
+                    var q = _blueprintQueue[i];
+                    if (q.GridUid == bpTask.GridUid &&
+                        q.Tile == bpTask.Tile &&
+                        string.Equals(q.Item.EntityPrototypeId, bpTask.Item.EntityPrototypeId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _blueprintQueue.RemoveAt(i);
+                        _completedBlueprintTasksCount++;
+                        break;
+                    }
+                }
+                _activeBlueprintTask = null;
+                _currentTaskElapsed = 0f;
+            }
+        }
+
+        _log.Info("AutoConstruct plan completed.");
+        FinishCurrentPlan(cancelled: false, clearGhost: false);
+
+        if (_blueprintQueue.Count == 0 && !_wiresSolver.IsSolving)
+        {
+            SetHudBanner(
+                wasDeconstruct ? "[AutoDeconstruct Complete]" : "[AutoBuild Complete]",
+                $"Finished {(wasDeconstruct ? "deconstructing" : "building")} {label} ({graphId}: {startNode} -> {targetNode}).",
+                isError: false,
+                duration: 2.5f);
+        }
+    }
+
+    private void AdvanceToNextStep()
+    {
+        _stepIndex++;
+        _rescanTimer = 0f;
+        _stepTotalElapsed = 0f;
+        _stepRetryCount = 0;
+        _equipRetryCount = 0;
+        _currentDiagnosticStatus = null;
+        _phase = StepExecutionPhase.PrepareAndEquip;
+    }
+
     private void ExecuteCurrentStep(EntityUid player, float frameTime)
     {
         if (_activePlan == null)
@@ -891,8 +1309,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
         if (_stepIndex >= _activePlan.Steps.Count)
         {
-            _log.Info("AutoConstruct plan completed.");
-            FinishCurrentPlan();
+            CompleteActivePlan();
             return;
         }
 
@@ -906,7 +1323,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 _targetMapCoords = _transform.GetMapCoordinates(replacement);
                 _rescanTimer = 0f;
                 _stepRetryCount = 0;
-        _equipRetryCount = 0;
+                _equipRetryCount = 0;
+                _currentDiagnosticStatus = null;
 
                 if (_phase == StepExecutionPhase.WaitForCompletion)
                 {
@@ -916,10 +1334,12 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 if (_activePlan == null || _stepIndex >= _activePlan.Steps.Count)
                 {
                     _log.Info("AutoConstruct plan completed after entity replacement.");
-                    FinishCurrentPlan();
+                    CompleteActivePlan();
                     return;
                 }
 
+                _stepTotalElapsed = 0f;
+                _currentTaskElapsed = 0f;
                 _phase = StepExecutionPhase.PrepareAndEquip;
                 _waitTimer = SettleDelay;
                 return;
@@ -930,15 +1350,32 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 if (_activePlan.IsDeconstruct && _stepIndex >= _activePlan.Steps.Count - 1)
                 {
                     _log.Info("Target deconstructed and deleted.");
-                    FinishCurrentPlan();
+                    CompleteActivePlan();
                     return;
                 }
 
-                _rescanTimer += frameTime;
-                if (_rescanTimer >= TargetRescanTimeout)
+                // If building a ghost step and the ghost was deleted, try re-spawning the ghost so we don't drop the build
+                var curMissingStep = _activePlan.Steps[_stepIndex];
+                if (curMissingStep.Kind == ConstructionActionKind.StartGhostConstruction &&
+                    !string.IsNullOrEmpty(curMissingStep.PrototypeOrQualityOrTag) &&
+                    _protoMan.TryIndex<ConstructionPrototype>(curMissingStep.PrototypeOrQualityOrTag, out var respawnCProto) &&
+                    _stepTotalElapsed < JobTimeoutSeconds)
                 {
-                    _log.Warning("Target entity disappeared and no replacement spawned within timeout; stopping job.");
-                    FinishCurrentPlan();
+                    if (_clientConstruction.TrySpawnGhost(respawnCProto, _targetCoordinates, _targetDirection, out var respawnedGhost) &&
+                        respawnedGhost.HasValue && Exists(respawnedGhost.Value))
+                    {
+                        _currentTarget = respawnedGhost.Value;
+                        _phase = StepExecutionPhase.PrepareAndEquip;
+                        _waitTimer = 0.35f;
+                        return;
+                    }
+                }
+
+                _rescanTimer += frameTime;
+                _currentDiagnosticStatus = $"Waiting for replacement entity to spawn on tile ({_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                if (_stepTotalElapsed >= JobTimeoutSeconds || _rescanTimer >= TargetRescanTimeout)
+                {
+                    FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s: target entity disappeared and no replacement spawned on tile.");
                 }
                 return;
             }
@@ -957,8 +1394,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             Exists(_currentTarget) &&
             _wiresSolver.IsDoorWelded(_currentTarget))
         {
-            _stepIndex++;
-            _phase = StepExecutionPhase.PrepareAndEquip;
+            AdvanceToNextStep();
             return;
         }
 
@@ -968,8 +1404,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             Exists(_currentTarget) &&
             _wiresSolver.IsWirePanelOpen(_currentTarget))
         {
-            _stepIndex++;
-            _phase = StepExecutionPhase.PrepareAndEquip;
+            AdvanceToNextStep();
             return;
         }
 
@@ -979,8 +1414,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             Exists(_currentTarget) &&
             !_solver.HasMachineFrameBoard(_currentTarget))
         {
-            _stepIndex++;
-            _phase = StepExecutionPhase.PrepareAndEquip;
+            AdvanceToNextStep();
             return;
         }
 
@@ -1003,14 +1437,12 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             bool isAnchored = Transform(_currentTarget).Anchored;
             if (step.Description.StartsWith("Unanchor", StringComparison.OrdinalIgnoreCase) && !isAnchored)
             {
-                _stepIndex++;
-                _phase = StepExecutionPhase.PrepareAndEquip;
+                AdvanceToNextStep();
                 return;
             }
             if (step.Description.StartsWith("Anchor frame", StringComparison.OrdinalIgnoreCase) && isAnchored)
             {
-                _stepIndex++;
-                _phase = StepExecutionPhase.PrepareAndEquip;
+                AdvanceToNextStep();
                 return;
             }
         }
@@ -1020,8 +1452,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             Exists(_currentTarget) &&
             _solver.DetectEntityPipeLayer(_currentTarget, out _) == desiredStepLayer)
         {
-            _stepIndex++;
-            _phase = StepExecutionPhase.PrepareAndEquip;
+            AdvanceToNextStep();
             return;
         }
 
@@ -1031,15 +1462,20 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             {
                 if (!PrepareAndEquipForStep(player, step))
                 {
-                    if (_equipRetryCount == 0 && TryOpenWornStorageSlots(player))
+                    if (_equipRetryCount == 0)
+                        TryOpenWornStorageSlots(player);
+
+                    _equipRetryCount++;
+                    var reqDesc = FormatStepRequirement(step);
+                    _currentDiagnosticStatus = $"Searching inventory/nearby for {reqDesc} (Attempt {_equipRetryCount}, {_stepTotalElapsed:0.0}s)...";
+
+                    if (_stepTotalElapsed < 3.5f)
                     {
-                        _equipRetryCount = 1;
-                        _waitTimer = 0.35f;
+                        _waitTimer = 0.45f;
                         return;
                     }
 
-                    _log.Warning($"Failed to equip required item for step [{_stepIndex + 1}/{_activePlan.Steps.Count}]: {step.Description}");
-                    FinishCurrentPlan();
+                    FailBlueprintOrJob($"Missing required {reqDesc} for step {_stepIndex + 1}/{_activePlan.Steps.Count} ('{step.Description}').");
                     return;
                 }
 
@@ -1080,10 +1516,10 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     }
 
                     _welderIgniteRetries++;
-                    if (_welderIgniteRetries > 6)
+                    _currentDiagnosticStatus = $"Cycling {GetEntityDisplayName(held.Value)} to '{requiredQuality}' mode (Attempt {_welderIgniteRetries})...";
+                    if (_welderIgniteRetries > 10 && _stepTotalElapsed >= 6f)
                     {
-                        _log.Warning($"Could not cycle multi-tool {ToPrettyString(held.Value)} to '{requiredQuality}' for step '{step.Description}'; stopping job.");
-                        FinishCurrentPlan();
+                        FailBlueprintOrJob($"Could not cycle multi-tool {GetEntityDisplayName(held.Value)} to '{requiredQuality}' mode for '{step.Description}'.");
                         return;
                     }
 
@@ -1105,10 +1541,10 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     }
 
                     _welderIgniteRetries++;
-                    if (_welderIgniteRetries > 6)
+                    _currentDiagnosticStatus = $"Igniting {GetEntityDisplayName(held.Value)} (Attempt {_welderIgniteRetries})...";
+                    if (_welderIgniteRetries > 10 && _stepTotalElapsed >= 6f)
                     {
-                        _log.Warning($"Could not ignite welder {ToPrettyString(held.Value)} for step '{step.Description}'; stopping job.");
-                        FinishCurrentPlan();
+                        FailBlueprintOrJob($"Could not ignite welder {GetEntityDisplayName(held.Value)} for '{step.Description}' (check welding fuel).");
                         return;
                     }
 
@@ -1132,7 +1568,18 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
                 if (step.Kind == ConstructionActionKind.StartGhostConstruction)
                 {
-                    if (HasGhostComponent(_currentTarget))
+                    if (!Exists(_currentTarget) || !HasGhostComponent(_currentTarget))
+                    {
+                        if (!string.IsNullOrEmpty(step.PrototypeOrQualityOrTag) &&
+                            _protoMan.TryIndex<ConstructionPrototype>(step.PrototypeOrQualityOrTag, out var ghostCProto) &&
+                            _clientConstruction.TrySpawnGhost(ghostCProto, _targetCoordinates, _targetDirection, out var newGhost) &&
+                            newGhost.HasValue && Exists(newGhost.Value))
+                        {
+                            _currentTarget = newGhost.Value;
+                        }
+                    }
+
+                    if (Exists(_currentTarget) && HasGhostComponent(_currentTarget))
                     {
                         StartGhostConstruction(_currentTarget);
                     }
@@ -1156,7 +1603,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     Exists(_currentTarget) &&
                     _wiresSolver.IsDoorOpen(_currentTarget))
                 {
-                    // Close the open door first; WaitForCompletion will re-trigger welding once closed
+                    _currentDiagnosticStatus = "Closing open door before welding shut...";
                     _itemUtil.EnqueueClickEntity(_currentTarget);
                     _waitTimer = 0.6f;
                     _phase = StepExecutionPhase.WaitForCompletion;
@@ -1171,7 +1618,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
             case StepExecutionPhase.WaitForCompletion:
             {
-                // If we started a ghost construction, wait until the ghost is replaced by the real entity
+                // 1. If we started a ghost construction, keep rechecking and retrying until the ghost is replaced by the real entity (up to 60s)
                 if (step.Kind == ConstructionActionKind.StartGhostConstruction)
                 {
                     if (TryRelocateNonGhostTarget(out var spawnedStructure))
@@ -1180,34 +1627,46 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         _targetCoordinates = Transform(spawnedStructure).Coordinates;
                         _targetMapCoords = _transform.GetMapCoordinates(spawnedStructure);
                         _rescanTimer = 0f;
+                        _stepTotalElapsed = 0f;
+                        _currentTaskElapsed = 0f;
                         _stepRetryCount = 0;
-        _equipRetryCount = 0;
+                        _equipRetryCount = 0;
+                        _currentDiagnosticStatus = null;
                         AdvancePastGhostStartSteps();
                         _phase = StepExecutionPhase.PrepareAndEquip;
                         return;
                     }
 
                     _rescanTimer += frameTime;
-                    if (!_sawDoAfterForStep && _rescanTimer >= 0.75f)
+                    if (_stepTotalElapsed >= JobTimeoutSeconds)
+                    {
+                        FailBlueprintOrJob(
+                            $"Timed out after {JobTimeoutSeconds:0}s waiting for construction ghost ({step.PrototypeOrQualityOrTag}) to spawn structure (tile obstructed, out of range, or missing material).");
+                        return;
+                    }
+
+                    if (!_sawDoAfterForStep && _rescanTimer >= StepRetryInterval)
                     {
                         _rescanTimer = 0f;
                         _stepRetryCount++;
-                        if (_stepRetryCount <= 3)
-                        {
-                            _phase = StepExecutionPhase.PrepareAndEquip;
-                            return;
-                        }
+                        _currentDiagnosticStatus =
+                            $"Waiting for ghost ({step.PrototypeOrQualityOrTag}) to spawn structure (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                        _phase = StepExecutionPhase.PrepareAndEquip;
+                        return;
                     }
 
-                    if (_rescanTimer >= TargetRescanTimeout || _stepRetryCount > 3)
+                    if (_sawDoAfterForStep && _rescanTimer >= StepRetryInterval * 1.5f)
                     {
-                        _log.Warning("Timed out waiting for construction ghost to spawn structure.");
-                        FinishCurrentPlan();
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        _currentDiagnosticStatus =
+                            $"Re-checking ghost structure spawn ({step.PrototypeOrQualityOrTag}) (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                        _phase = StepExecutionPhase.PrepareAndEquip;
                     }
                     return;
                 }
 
-                // For steps with a DoAfter delay (e.g. Welding, Wrenching, Prying, Screwing), ensure the DoAfter
+                // 2. For steps with a DoAfter delay (e.g. Welding, Wrenching, Prying, Screwing), ensure the DoAfter
                 // actually started and finished on the server before swapping tools or advancing to the next step.
                 if (step.DoAfterDelay > 0f)
                 {
@@ -1215,8 +1674,20 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
                     if (_doAfterCancelledForStep)
                     {
-                        _log.Warning($"DoAfter cancelled during step '{step.Description}'; stopping job.");
-                        FinishCurrentPlan(cancelled: true);
+                        if (_stepTotalElapsed >= JobTimeoutSeconds)
+                        {
+                            FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s because DoAfter for '{step.Description}' kept getting interrupted.");
+                            return;
+                        }
+
+                        _doAfterCancelledForStep = false;
+                        _sawDoAfterForStep = false;
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        _currentDiagnosticStatus =
+                            $"DoAfter interrupted on '{step.Description}' — retrying (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                        _waitTimer = 0.45f;
+                        _phase = StepExecutionPhase.PrepareAndEquip;
                         return;
                     }
 
@@ -1283,23 +1754,24 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                             stepAlreadyProgressed = true;
                         }
 
-                        if (!stepAlreadyProgressed && _stepWaitElapsed < Math.Min(0.85f, step.DoAfterDelay + 0.4f))
+                        if (!stepAlreadyProgressed && _stepWaitElapsed < Math.Min(0.95f, step.DoAfterDelay + 0.45f))
                         {
                             return;
                         }
 
                         if (!stepAlreadyProgressed && step.DoAfterDelay >= 0.45f)
                         {
-                            _stepRetryCount++;
-                            if (_stepRetryCount <= 3)
+                            if (_stepTotalElapsed >= JobTimeoutSeconds)
                             {
-                                _rescanTimer = 0f;
-                                _phase = StepExecutionPhase.PrepareAndEquip;
+                                FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s: step '{step.Description}' never started its DoAfter.");
                                 return;
                             }
 
-                            _log.Warning($"Step '{step.Description}' never started its DoAfter ({step.DoAfterDelay:0.0}s) after retries; stopping job.");
-                            FinishCurrentPlan();
+                            _stepRetryCount++;
+                            _rescanTimer = 0f;
+                            _currentDiagnosticStatus =
+                                $"Retrying '{step.Description}' — waiting for DoAfter to start (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                            _phase = StepExecutionPhase.PrepareAndEquip;
                             return;
                         }
                     }
@@ -1320,18 +1792,19 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     !_wiresSolver.IsDoorWelded(_currentTarget))
                 {
                     _rescanTimer += frameTime;
-                    if (_rescanTimer >= 0.7f)
+                    if (_rescanTimer >= StepRetryInterval)
                     {
-                        _rescanTimer = 0f;
-                        _stepRetryCount++;
-                        if (_stepRetryCount <= 3)
+                        if (_stepTotalElapsed >= JobTimeoutSeconds)
                         {
-                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s: '{step.Description}' did not weld the door shut.");
                             return;
                         }
 
-                        _log.Warning($"Step '{step.Description}' did not weld door shut after retries; stopping job.");
-                        FinishCurrentPlan();
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        _currentDiagnosticStatus =
+                            $"Retrying '{step.Description}' (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                        _phase = StepExecutionPhase.PrepareAndEquip;
                     }
                     return;
                 }
@@ -1343,18 +1816,19 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     !_wiresSolver.IsWirePanelOpen(_currentTarget))
                 {
                     _rescanTimer += frameTime;
-                    if (_rescanTimer >= 0.6f)
+                    if (_rescanTimer >= StepRetryInterval)
                     {
-                        _rescanTimer = 0f;
-                        _stepRetryCount++;
-                        if (_stepRetryCount <= 3)
+                        if (_stepTotalElapsed >= JobTimeoutSeconds)
                         {
-                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s: '{step.Description}' did not open the wire panel.");
                             return;
                         }
 
-                        _log.Warning($"Step '{step.Description}' did not open wire panel after retries; stopping job.");
-                        FinishCurrentPlan();
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        _currentDiagnosticStatus =
+                            $"Retrying '{step.Description}' (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                        _phase = StepExecutionPhase.PrepareAndEquip;
                     }
                     return;
                 }
@@ -1366,18 +1840,19 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     _solver.HasMachineFrameBoard(_currentTarget))
                 {
                     _rescanTimer += frameTime;
-                    if (_rescanTimer >= 0.65f)
+                    if (_rescanTimer >= StepRetryInterval)
                     {
-                        _rescanTimer = 0f;
-                        _stepRetryCount++;
-                        if (_stepRetryCount <= 3)
+                        if (_stepTotalElapsed >= JobTimeoutSeconds)
                         {
-                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s: '{step.Description}' did not eject board from machine frame.");
                             return;
                         }
 
-                        _log.Warning($"Step '{step.Description}' did not eject board from machine frame after retries; stopping job.");
-                        FinishCurrentPlan();
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        _currentDiagnosticStatus =
+                            $"Retrying '{step.Description}' (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                        _phase = StepExecutionPhase.PrepareAndEquip;
                     }
                     return;
                 }
@@ -1402,35 +1877,46 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         consumed = true;
                     }
 
+                    if (!consumed &&
+                        Exists(_currentTarget) &&
+                        !string.IsNullOrEmpty(step.ExpectedNextNode) &&
+                        !string.Equals(step.ExpectedNextNode, _stepStartNode, StringComparison.OrdinalIgnoreCase) &&
+                        _solver.TryResolveGraphAndNode(_currentTarget, out _, out var postInsertNode, out _) &&
+                        postInsertNode != null &&
+                        string.Equals(postInsertNode.Name, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase))
+                    {
+                        consumed = true;
+                    }
+
                     if (!consumed)
                     {
                         _rescanTimer += frameTime;
-                        if (_rescanTimer >= 0.55f)
+                        if (_rescanTimer >= 0.85f)
                         {
                             _rescanTimer = 0f;
                             _stepRetryCount++;
-                            if (_stepRetryCount <= 2)
-                            {
-                                _phase = StepExecutionPhase.PrepareAndEquip;
-                                return;
-                            }
 
                             // If inserting a part/material into a MachineFrame that already has its board,
-                            // that specific requirement slot may already be satisfied; advance to the next step.
-                            if (string.Equals(_activePlan.GraphId, "Machine", StringComparison.OrdinalIgnoreCase) &&
+                            // that specific requirement slot may already be satisfied after 2 attempts; advance to the next step.
+                            if (_stepRetryCount > 2 &&
+                                string.Equals(_activePlan.GraphId, "Machine", StringComparison.OrdinalIgnoreCase) &&
                                 Exists(_currentTarget) &&
                                 _solver.HasMachineFrameBoard(_currentTarget) &&
                                 !_solver.IsMachineBoardEntity(_stepStartHeldItem.Value))
                             {
-                                _stepIndex++;
-                                _stepRetryCount = 0;
-        _equipRetryCount = 0;
-                                _phase = StepExecutionPhase.PrepareAndEquip;
+                                AdvanceToNextStep();
                                 return;
                             }
 
-                            _log.Warning($"Step '{step.Description}' did not consume held item after retries; stopping job.");
-                            FinishCurrentPlan();
+                            if (_stepTotalElapsed >= JobTimeoutSeconds)
+                            {
+                                FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s: step '{step.Description}' did not consume or insert the held item.");
+                                return;
+                            }
+
+                            _currentDiagnosticStatus =
+                                $"Retrying '{step.Description}' — item not yet inserted (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                            _phase = StepExecutionPhase.PrepareAndEquip;
                         }
                         return;
                     }
@@ -1448,7 +1934,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     if ((wantsUnanchor && isAnchored) || (wantsAnchor && !isAnchored))
                     {
                         _rescanTimer += frameTime;
-                        if (_rescanTimer >= 0.7f)
+                        if (_rescanTimer >= StepRetryInterval)
                         {
                             // If anchoring on Primary failed and the next step(s) adjust pipe layer via Screwdriver,
                             // swap the pipe-layer Screwdriver step(s) before Anchor frame so it switches layer while unanchored first.
@@ -1467,21 +1953,24 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                                 _activePlan.Steps[insertIdx] = anchorStep;
                                 _rescanTimer = 0f;
                                 _stepRetryCount = 0;
-        _equipRetryCount = 0;
+                                _equipRetryCount = 0;
+                                _currentDiagnosticStatus = "Switching pipe layer via Screwdriver before anchoring...";
                                 _phase = StepExecutionPhase.PrepareAndEquip;
+                                return;
+                            }
+
+                            if (_stepTotalElapsed >= JobTimeoutSeconds)
+                            {
+                                FailBlueprintOrJob(
+                                    $"Timed out after {JobTimeoutSeconds:0}s: '{step.Description}' could not {(wantsAnchor ? "anchor" : "unanchor")} {_currentTargetLabel} (tile layer occupied or obstructed).");
                                 return;
                             }
 
                             _rescanTimer = 0f;
                             _stepRetryCount++;
-                            if (_stepRetryCount <= 3)
-                            {
-                                _phase = StepExecutionPhase.PrepareAndEquip;
-                                return;
-                            }
-
-                            _log.Warning($"Step '{step.Description}' did not change anchored state after retries; stopping job.");
-                            FinishCurrentPlan();
+                            _currentDiagnosticStatus =
+                                $"Retrying '{step.Description}' (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                            _phase = StepExecutionPhase.PrepareAndEquip;
                         }
                         return;
                     }
@@ -1511,22 +2000,21 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         _solver.DetectEntityPipeLayer(_currentTarget, out _) != verifyPipeLayer)
                     {
                         _rescanTimer += frameTime;
-                        if (_rescanTimer >= 0.65f)
+                        if (_rescanTimer >= StepRetryInterval)
                         {
-                            _rescanTimer = 0f;
-                            _stepRetryCount++;
-                            if (_stepRetryCount <= 3)
+                            if (_stepTotalElapsed >= JobTimeoutSeconds)
                             {
-                                _phase = StepExecutionPhase.PrepareAndEquip;
+                                FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s: '{step.Description}' did not change pipe layer on {_currentTargetLabel}.");
                                 return;
                             }
 
-                            _log.Warning($"Step '{step.Description}' did not change pipe layer after retries; advancing.");
+                            _rescanTimer = 0f;
+                            _stepRetryCount++;
+                            _currentDiagnosticStatus =
+                                $"Retrying '{step.Description}' (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                            _phase = StepExecutionPhase.PrepareAndEquip;
                         }
-                        else
-                        {
-                            return;
-                        }
+                        return;
                     }
                 }
 
@@ -1550,33 +2038,30 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                         _currentTarget = spawnedReplacement;
                         _targetCoordinates = Transform(spawnedReplacement).Coordinates;
                         _targetMapCoords = _transform.GetMapCoordinates(spawnedReplacement);
-                        _stepIndex++;
-                        _rescanTimer = 0f;
-                        _stepRetryCount = 0;
-        _equipRetryCount = 0;
-                        _phase = StepExecutionPhase.PrepareAndEquip;
+                        AdvanceToNextStep();
                         return;
                     }
 
                     _rescanTimer += frameTime;
-                    if (_rescanTimer >= 0.85f)
+                    if (_rescanTimer >= StepRetryInterval)
                     {
-                        _rescanTimer = 0f;
-                        _stepRetryCount++;
-                        if (_stepRetryCount <= 3)
+                        if (_stepTotalElapsed >= JobTimeoutSeconds)
                         {
-                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s: step '{step.Description}' did not transition to node '{step.ExpectedNextNode}'.");
                             return;
                         }
 
-                        _log.Warning($"Step '{step.Description}' did not transition to node '{step.ExpectedNextNode}' after retries; stopping job.");
-                        FinishCurrentPlan();
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        _currentDiagnosticStatus =
+                            $"Waiting for '{step.Description}' -> '{step.ExpectedNextNode}' (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                        _phase = StepExecutionPhase.PrepareAndEquip;
                     }
                     return;
                 }
 
                 // If this step transitions an in-place frame node (e.g. MachineFrame missingWires <-> machineFrame,
-                // or ComputerFrame stages 0..4) without replacing the entity, verify the node changed before advancing.
+                // ComputerFrame stages 0..4, or Airlock panel security nodes) without replacing the entity, verify the node changed before advancing.
                 if (isFinalStepOfEdge &&
                     !expectsEntityReplacement &&
                     !string.IsNullOrEmpty(step.ExpectedNextNode) &&
@@ -1588,27 +2073,24 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     !string.Equals(currentFrameNode.Name, step.ExpectedNextNode, StringComparison.OrdinalIgnoreCase))
                 {
                     _rescanTimer += frameTime;
-                    if (_rescanTimer >= 0.65f)
+                    if (_rescanTimer >= StepRetryInterval)
                     {
-                        _rescanTimer = 0f;
-                        _stepRetryCount++;
-                        if (_stepRetryCount <= 3)
+                        if (_stepTotalElapsed >= JobTimeoutSeconds)
                         {
-                            _phase = StepExecutionPhase.PrepareAndEquip;
+                            FailBlueprintOrJob($"Timed out after {JobTimeoutSeconds:0}s: step '{step.Description}' did not reach node '{step.ExpectedNextNode}'.");
                             return;
                         }
 
-                        _log.Warning($"Step '{step.Description}' did not reach frame node '{step.ExpectedNextNode}' after retries; stopping job.");
-                        FinishCurrentPlan();
+                        _rescanTimer = 0f;
+                        _stepRetryCount++;
+                        _currentDiagnosticStatus =
+                            $"Waiting for node '{step.ExpectedNextNode}' on '{step.Description}' (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+                        _phase = StepExecutionPhase.PrepareAndEquip;
                     }
                     return;
                 }
 
-                _stepIndex++;
-                _rescanTimer = 0f;
-                _stepRetryCount = 0;
-        _equipRetryCount = 0;
-                _phase = StepExecutionPhase.PrepareAndEquip;
+                AdvanceToNextStep();
                 break;
             }
         }
@@ -1705,11 +2187,14 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         }
 
         _stepRetryCount++;
-        if (_stepRetryCount <= 2)
+        if (_stepTotalElapsed < JobTimeoutSeconds && _stepRetryCount <= 12)
+        {
+            _currentDiagnosticStatus = $"Retrying internal wire cutting (Attempt {_stepRetryCount + 1}, {_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s)...";
+            _waitTimer = 0.5f;
             return;
+        }
 
-        _log.Warning($"Wire-cut solve on {ToPrettyString(_currentTarget)} did not cut all wires; stopping job.");
-        FinishCurrentPlan();
+        FailBlueprintOrJob($"Could not cut all internal wires on {GetEntityDisplayName(_currentTarget)} (check Wirecutters/Multitool or insulated gloves).");
     }
 
     private bool PrepareAndEquipForStep(EntityUid player, ConstructionActionStep step)
@@ -2469,8 +2954,15 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         }
     }
 
-    private EntityUid? FindTargetAtCursor(EntityUid player, MapCoordinates cursorMapCoords)
+    private EntityUid? FindTargetAtCursor(
+        EntityUid player,
+        MapCoordinates cursorMapCoords,
+        out EntityUid? outOfRangeTarget,
+        out float outOfRangeDist)
     {
+        outOfRangeTarget = null;
+        outOfRangeDist = 0f;
+
         var playerPos = _transform.GetMapCoordinates(player);
         var nearby = _lookup.GetEntitiesInRange(cursorMapCoords, 0.65f, LookupFlags.Uncontained);
 
@@ -2500,6 +2992,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         // 2. Otherwise find the topmost constructible/deconstructible entity within interaction range
         EntityUid? bestEntity = null;
         float bestScore = float.MaxValue;
+        float bestOutOfRangeScore = float.MaxValue;
 
         foreach (var uid in nearby)
         {
@@ -2510,19 +3003,26 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             if (pos.MapId != playerPos.MapId)
                 continue;
 
-            if ((pos.Position - playerPos.Position).Length() > MaxInteractRange)
-                continue;
-
             if (!_solver.TryResolveGraphAndNode(uid, out _, out _, out _))
                 continue;
 
             float score = (pos.Position - cursorMapCoords.Position).LengthSquared();
-
-            // Prefer above-floor structures (consoles, machines, walls, doors, frames) over subfloor pipes/cables on the same tile
             if (IsSubfloorEntity(uid))
                 score += 0.02f;
             else if (IsGhostOrUnfinishedFrame(uid))
                 score -= 0.01f;
+
+            float playerDist = (pos.Position - playerPos.Position).Length();
+            if (playerDist > MaxInteractRange)
+            {
+                if (score < bestOutOfRangeScore)
+                {
+                    bestOutOfRangeScore = score;
+                    outOfRangeTarget = uid;
+                    outOfRangeDist = playerDist;
+                }
+                continue;
+            }
 
             if (score < bestScore)
             {
@@ -3067,6 +3567,380 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
         targetPipeLayer = 0;
         return true;
+    }
+
+    public bool IsPlayerMoving(EntityUid player)
+    {
+        if (!Exists(player))
+            return false;
+
+        var curMapCoords = _transform.GetMapCoordinates(player);
+        bool movedPosition = _lastPlayerMapCoords.MapId == curMapCoords.MapId &&
+                             (curMapCoords.Position - _lastPlayerMapCoords.Position).LengthSquared() > 0.00015f;
+        _lastPlayerMapCoords = curMapCoords;
+
+        // 1. Check InputMoverComponent held movement keys (WASD / Walk)
+        var moverComp = FindComponentByName(player, "InputMoverComponent");
+        if (moverComp != null)
+        {
+            var buttonsObj = GetMemberValue(moverComp, "HeldMoveButtons") ?? GetMemberValue(moverComp, "_heldMoveButtons");
+            if (buttonsObj is Enum eVal)
+            {
+                // MoveButtons: None = 0, Up = 1, Down = 2, Left = 4, Right = 8 (directional bits 1..15)
+                int bits = Convert.ToInt32(eVal) & 0xF;
+                if (bits != 0)
+                    return true;
+            }
+        }
+
+        // 2. Check PhysicsComponent linear velocity
+        var physicsComp = FindComponentByName(player, "PhysicsComponent");
+        if (physicsComp != null && GetMemberValue(physicsComp, "LinearVelocity") is Vector2 vel)
+        {
+            if (vel.LengthSquared() > 0.0025f)
+                return true;
+        }
+
+        return movedPosition;
+    }
+
+    private string GetEntityDisplayName(EntityUid uid)
+    {
+        if (!Exists(uid))
+            return "target";
+
+        if (HasGhostComponent(uid))
+        {
+            var ghostComp = FindComponentByName(uid, "ConstructionGhostComponent");
+            var proto = GetMemberValue(ghostComp, "Prototype") as ConstructionPrototype;
+            var protoId = proto?.ID ?? GetStringMember(ghostComp, "Prototype");
+            if (!string.IsNullOrEmpty(protoId))
+                return $"ghost:{protoId}";
+        }
+
+        var meta = MetaData(uid);
+        var name = meta.EntityName;
+        var pId = meta.EntityPrototype?.ID;
+        if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(pId) && !string.Equals(name, pId, StringComparison.OrdinalIgnoreCase))
+            return $"{name} ({pId})";
+
+        return !string.IsNullOrEmpty(pId) ? pId : (!string.IsNullOrEmpty(name) ? name : uid.ToString());
+    }
+
+    private static string FormatStepRequirement(ConstructionActionStep step)
+    {
+        return step.Kind switch
+        {
+            ConstructionActionKind.AddMaterial => $"material '{step.Amount}x {step.PrototypeOrQualityOrTag}'",
+            ConstructionActionKind.UseTool => $"tool with '{step.PrototypeOrQualityOrTag}' quality",
+            ConstructionActionKind.CutWires => "Wirecutters / Multitool",
+            ConstructionActionKind.InsertPrototype => $"item '{step.Amount}x {step.PrototypeOrQualityOrTag}'",
+            ConstructionActionKind.InsertComponent => $"component item '{step.PrototypeOrQualityOrTag}'",
+            ConstructionActionKind.InsertTag => $"tagged item '[{step.PrototypeOrQualityOrTag}]'",
+            ConstructionActionKind.StartGhostConstruction => $"starting material/tool for '{step.PrototypeOrQualityOrTag}'",
+            _ => step.Description
+        };
+    }
+
+    public string? GetActiveStepHudSummary()
+    {
+        if (_activePlan == null || _stepIndex < 0 || _stepIndex >= _activePlan.Steps.Count)
+            return null;
+
+        var step = _activePlan.Steps[_stepIndex];
+        return $"Step {_stepIndex + 1}/{_activePlan.Steps.Count}: {step.Description}";
+    }
+
+    public float GetActiveStepProgress()
+    {
+        if (_activePlan == null || _activePlan.Steps.Count == 0)
+            return 0f;
+
+        return Math.Clamp((float)(_stepIndex + 1) / _activePlan.Steps.Count, 0.05f, 0.98f);
+    }
+
+    public bool TryGetHudDisplay(
+        out string header,
+        out string detail,
+        out string? subDetail,
+        out float progress,
+        out Color accentColor,
+        out MapCoordinates? highlightMapCoords)
+    {
+        header = string.Empty;
+        detail = string.Empty;
+        subDetail = null;
+        progress = 0f;
+        accentColor = Color.Cyan;
+        highlightMapCoords = null;
+
+        // 1. Standalone AutoHack active solve takes priority when solving
+        if (_wiresSolver.IsSolving &&
+            _wiresSolver.TryGetHudStatus(out var hackHeader, out var hackDetail, out var hackSub, out var hackProg, out var hackErr, out _, out var hackTarget))
+        {
+            header = hackHeader;
+            detail = hackDetail;
+            subDetail = hackSub;
+            progress = hackProg;
+            accentColor = hackErr ? Color.OrangeRed : Color.Gold;
+            if (hackTarget.HasValue && Exists(hackTarget.Value))
+                highlightMapCoords = _transform.GetMapCoordinates(hackTarget.Value);
+            return true;
+        }
+
+        // 2. Active AutoConstruct / AutoDeconstruct / Blueprint Build
+        if (_activePlan != null || _blueprintQueue.Count > 0)
+        {
+            bool isBlueprint = _blueprintQueue.Count > 0 || _activeBlueprintTask != null;
+            bool isDeconstruct = _activePlan?.IsDeconstruct == true;
+
+            if (Exists(_currentTarget))
+                highlightMapCoords = _transform.GetMapCoordinates(_currentTarget);
+            else if (_targetMapCoords.MapId != MapId.Nullspace)
+                highlightMapCoords = _targetMapCoords;
+
+            if (isBlueprint)
+            {
+                int total = Math.Max(_totalBlueprintTasksQueued, _completedBlueprintTasksCount + _blueprintQueue.Count);
+                int currentItemNum = Math.Min(total, _completedBlueprintTasksCount + 1);
+                var bpName = _activeBlueprintName ?? "Blueprint";
+                var phase = CurrentActiveBlueprintPhase;
+                var itemProto = _activeBlueprintTask?.Item.EntityPrototypeId ?? _desiredBlueprintEntityProtoId ?? _currentTargetLabel;
+
+                header = $"[Blueprint '{bpName}' ({currentItemNum}/{Math.Max(1, total)})] Building {itemProto}";
+
+                if (_activePlan != null && _stepIndex >= 0 && _stepIndex < _activePlan.Steps.Count)
+                {
+                    var step = _activePlan.Steps[_stepIndex];
+                    detail = $"Step {_stepIndex + 1}/{_activePlan.Steps.Count}: {step.Description} [{_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s]";
+                    subDetail = _currentDiagnosticStatus ?? $"Phase {(int)(phase ?? 0)} ({phase}) — {_blueprintQueue.Count} remaining";
+                    float itemFrac = (float)_stepIndex / Math.Max(1, _activePlan.Steps.Count);
+                    progress = Math.Clamp((_completedBlueprintTasksCount + itemFrac) / Math.Max(1, total), 0.04f, 0.99f);
+                }
+                else
+                {
+                    detail = _currentDiagnosticStatus ?? $"Preparing next item in Phase {(int)(phase ?? 0)} ({phase})...";
+                    subDetail = $"{_blueprintQueue.Count} item(s) remaining in queue";
+                    progress = Math.Clamp((float)_completedBlueprintTasksCount / Math.Max(1, total), 0.04f, 0.99f);
+                }
+
+                accentColor = _stepRetryCount > 0 || !string.IsNullOrEmpty(_currentDiagnosticStatus)
+                    ? Color.Gold
+                    : Color.Cyan;
+                return true;
+            }
+
+            // Single-target AutoBuild or AutoDeconstruct
+            var plan = _activePlan!;
+            var stepIdx = Math.Clamp(_stepIndex, 0, Math.Max(0, plan.Steps.Count - 1));
+            var curStep = plan.Steps[stepIdx];
+            var modeTag = isDeconstruct ? "AutoDeconstruct" : "AutoBuild";
+
+            header = $"[{modeTag}] {_currentTargetLabel} ({plan.StartNode} -> {plan.TargetNode})";
+            detail = $"Step {stepIdx + 1}/{plan.Steps.Count}: {curStep.Description} [{_stepTotalElapsed:0.0}s / {JobTimeoutSeconds:0}s]";
+            subDetail = _currentDiagnosticStatus;
+            progress = Math.Clamp((float)(stepIdx + 1) / Math.Max(1, plan.Steps.Count), 0.08f, 0.98f);
+            accentColor = _stepRetryCount > 0
+                ? Color.Gold
+                : (isDeconstruct ? Color.Orange : Color.Cyan);
+            return true;
+        }
+
+        // 3. Recent failure or completion banner from AutoConstruct
+        if (_hudBannerTimer > 0f && !string.IsNullOrEmpty(_hudBannerHeader))
+        {
+            header = _hudBannerHeader!;
+            detail = _hudBannerDetail ?? string.Empty;
+            progress = 1f;
+            accentColor = _hudBannerIsError ? Color.OrangeRed : Color.LimeGreen;
+            return true;
+        }
+
+        // 4. Recent failure or completion banner from AutoHack
+        if (_wiresSolver.TryGetHudStatus(out var hBanner, out var dBanner, out var sBanner, out var pBanner, out var errBanner, out var compBanner, out _))
+        {
+            header = hBanner;
+            detail = dBanner;
+            subDetail = sBanner;
+            progress = pBanner;
+            accentColor = errBanner ? Color.OrangeRed : (compBanner ? Color.LimeGreen : Color.Gold);
+            return true;
+        }
+
+        return false;
+    }
+}
+
+/// <summary>
+/// Renders an AutoChem-style top-center HUD status box and world-space target highlight
+/// for AutoBuild, Blueprint Build, AutoDeconstruct, and AutoHack.
+/// </summary>
+public sealed class RobustaConstructHackHudOverlay : Overlay
+{
+    private readonly IEntityManager _entMan;
+    private readonly Font _font;
+    private readonly Font _subFont;
+
+    public override OverlaySpace Space => OverlaySpace.ScreenSpace | OverlaySpace.WorldSpace;
+
+    public RobustaConstructHackHudOverlay()
+    {
+        _entMan = IoCManager.Resolve<IEntityManager>();
+        var cache = IoCManager.Resolve<IResourceCache>();
+        var fontRes = cache.GetResource<FontResource>("/Fonts/NotoSans/NotoSans-Regular.ttf");
+        _font = new VectorFont(fontRes, 12);
+        _subFont = new VectorFont(fontRes, 11);
+    }
+
+    protected override void Draw(in OverlayDrawArgs args)
+    {
+        if (!_entMan.EntitySysManager.TryGetEntitySystem<RobustaAutoConstructSystem>(out var autoConstruct))
+            return;
+
+        if (!autoConstruct.TryGetHudDisplay(
+                out var header,
+                out var detail,
+                out var subDetail,
+                out float progress,
+                out var accentColor,
+                out var highlightMapCoords))
+        {
+            return;
+        }
+
+        if ((args.Space & OverlaySpace.WorldSpace) != 0 &&
+            highlightMapCoords.HasValue &&
+            highlightMapCoords.Value.MapId == args.MapId)
+        {
+            DrawDistinctActiveTargetMarker(args.WorldHandle, highlightMapCoords.Value.Position);
+        }
+
+        if ((args.Space & OverlaySpace.ScreenSpace) != 0)
+        {
+            DrawScreenHud(args.ScreenHandle, args.Viewport.Size, header, detail, subDetail, progress, accentColor);
+        }
+    }
+
+    private static void DrawDistinctActiveTargetMarker(DrawingHandleWorld worldHandle, Vector2 center)
+    {
+        // High-contrast Magenta/HotPink + Gold diamond & target ring so the active build item is
+        // immediately distinguishable from the cyan/orange square blueprint tile previews.
+        var primaryColor = Color.FromHex("#FF2A85");
+        var secondaryColor = Color.Gold;
+
+        // 1. Soft filled circle & outer ring
+        worldHandle.DrawCircle(center, 0.38f, primaryColor.WithAlpha(0.18f), filled: true);
+        worldHandle.DrawCircle(center, 0.38f, primaryColor.WithAlpha(0.95f), filled: false);
+        worldHandle.DrawCircle(center, 0.12f, secondaryColor.WithAlpha(0.9f), filled: false);
+
+        // 2. Rotated outer diamond (rhombus)
+        float rOuter = 0.48f;
+        var top = center + new Vector2(0f, rOuter);
+        var right = center + new Vector2(rOuter, 0f);
+        var bottom = center + new Vector2(0f, -rOuter);
+        var left = center + new Vector2(-rOuter, 0f);
+
+        worldHandle.DrawLine(top, right, primaryColor);
+        worldHandle.DrawLine(right, bottom, primaryColor);
+        worldHandle.DrawLine(bottom, left, primaryColor);
+        worldHandle.DrawLine(left, top, primaryColor);
+
+        // 3. Inner Gold diamond
+        float rInner = 0.28f;
+        var iTop = center + new Vector2(0f, rInner);
+        var iRight = center + new Vector2(rInner, 0f);
+        var iBottom = center + new Vector2(0f, -rInner);
+        var iLeft = center + new Vector2(-rInner, 0f);
+
+        worldHandle.DrawLine(iTop, iRight, secondaryColor);
+        worldHandle.DrawLine(iRight, iBottom, secondaryColor);
+        worldHandle.DrawLine(iBottom, iLeft, secondaryColor);
+        worldHandle.DrawLine(iLeft, iTop, secondaryColor);
+
+        // 4. Diagonal crosshair ticks pointing toward center
+        float diagStart = 0.42f;
+        float diagEnd = 0.20f;
+        Vector2[] dirs =
+        {
+            new(0.7071f, 0.7071f),
+            new(0.7071f, -0.7071f),
+            new(-0.7071f, 0.7071f),
+            new(-0.7071f, -0.7071f)
+        };
+        foreach (var d in dirs)
+        {
+            worldHandle.DrawLine(center + d * diagStart, center + d * diagEnd, secondaryColor);
+        }
+    }
+
+    private void DrawScreenHud(
+        DrawingHandleScreen screenHandle,
+        Vector2i viewportSize,
+        string header,
+        string detail,
+        string? subDetail,
+        float progress,
+        Color accentColor)
+    {
+        var headerDim = screenHandle.GetDimensions(_font, header, 1f);
+        var detailDim = screenHandle.GetDimensions(_font, detail, 1f);
+        var subDim = !string.IsNullOrEmpty(subDetail)
+            ? screenHandle.GetDimensions(_subFont, subDetail, 1f)
+            : Vector2.Zero;
+
+        float padding = 14f;
+        float verticalGap = 8f;
+        float barHeight = 4f;
+
+        float maxTextWidth = Math.Max(headerDim.X, Math.Max(detailDim.X, subDim.X));
+        float boxWidth = Math.Clamp(maxTextWidth + padding * 2.2f, 300f, 640f);
+
+        float boxHeight = padding + headerDim.Y + verticalGap + detailDim.Y + verticalGap + barHeight + padding;
+        if (!string.IsNullOrEmpty(subDetail))
+            boxHeight += subDim.Y + verticalGap;
+
+        float topY = 76f;
+        if (_entMan.EntitySysManager.TryGetEntitySystem<RobustoClient.Systems.AutoChem.RobustaAutoChemSystem>(out var autoChem) &&
+            autoChem.CurrentState is not RobustoClient.Systems.AutoChem.IdleState)
+        {
+            topY = 150f;
+        }
+
+        var basePos = new Vector2(viewportSize.X / 2f - boxWidth / 2f, topY);
+        var boxSize = new Vector2(boxWidth, boxHeight);
+
+        // Background & border (matching RobustaAutoChemOverlay aesthetic)
+        screenHandle.DrawRect(UIBox2.FromDimensions(basePos, boxSize), Color.Black.WithAlpha(0.85f));
+        screenHandle.DrawRect(UIBox2.FromDimensions(basePos, boxSize), accentColor.WithAlpha(0.45f), filled: false);
+
+        float currentY = basePos.Y + padding;
+
+        // 1. Header line
+        screenHandle.DrawString(_font, new Vector2(basePos.X + padding, currentY), header, accentColor);
+        currentY += headerDim.Y + verticalGap;
+
+        // 2. Step / primary detail line
+        screenHandle.DrawString(_font, new Vector2(basePos.X + padding, currentY), detail, Color.White);
+        currentY += detailDim.Y + verticalGap;
+
+        // 3. Optional diagnostic / retry / queue sub-detail line
+        if (!string.IsNullOrEmpty(subDetail))
+        {
+            screenHandle.DrawString(_subFont, new Vector2(basePos.X + padding, currentY), subDetail, Color.LightGray);
+            currentY += subDim.Y + verticalGap;
+        }
+
+        // 4. Progress bar
+        var barPos = new Vector2(basePos.X + padding, currentY);
+        var barFullWidth = boxWidth - (padding * 2f);
+        var clampedProgress = Math.Clamp(progress, 0f, 1f);
+
+        Color barColor = accentColor == Color.OrangeRed
+            ? Color.Crimson
+            : (clampedProgress < 1f ? Color.LimeGreen : Color.Gold);
+
+        screenHandle.DrawRect(UIBox2.FromDimensions(barPos, new Vector2(barFullWidth, barHeight)), Color.DarkSlateGray);
+        screenHandle.DrawRect(UIBox2.FromDimensions(barPos, new Vector2(barFullWidth * clampedProgress, barHeight)), barColor);
     }
 }
 
