@@ -12,6 +12,7 @@ using Content.Shared.DoAfter;
 using Content.Shared.Hands;
 using Content.Shared.Hands.Components;
 using Content.Shared.Hands.EntitySystems;
+using Content.Shared.Interaction;
 using Content.Shared.Inventory;
 using Content.Shared.Inventory.Events;
 using Content.Shared.Stacks;
@@ -62,8 +63,6 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
     private const int CheckFrameInterval = 5;
     private const float JobTimeoutSeconds = 60f;
-    private const float MaxInteractRange = 2.5f;
-    private const float BlueprintBuildInteractRange = 1.55f;
     private const float SettleDelay = 0.25f;
     private const float TargetRescanTimeout = 60f;
     private const float DoubleTapOrHoldWindow = 0.25f;
@@ -244,7 +243,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         {
             if (outOfRangeTarget.HasValue && Exists(outOfRangeTarget.Value))
             {
-                var rangeMsg = $"Target '{GetEntityDisplayName(outOfRangeTarget.Value)}' is out of range ({outOfRangeDist:0.1}m > {MaxInteractRange:0.1}m) — move closer.";
+                var rangeMsg = $"Target '{GetEntityDisplayName(outOfRangeTarget.Value)}' is out of range ({outOfRangeDist:0.1}m > {SharedInteractionSystem.InteractionRange:0.1}m) — move closer.";
                 _log.Info(rangeMsg);
                 SetHudBanner("[AutoConstruct]", rangeMsg, isError: true, duration: 4.5f);
             }
@@ -718,7 +717,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 nearestAnyIdx = i;
             }
 
-            if (d > BlueprintBuildInteractRange)
+            if (d > SharedInteractionSystem.InteractionRange)
                 continue;
 
             if (subPriority < bestSubPriority ||
@@ -743,7 +742,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 _targetCoordinates = _mapSystem.GridTileToLocal(nearest.GridUid, nGrid, nearest.Tile);
                 _targetMapCoords = _transform.ToMapCoordinates(_targetCoordinates);
                 _currentDiagnosticStatus =
-                    $"Paused: Step closer to '{nearest.Item.EntityPrototypeId}' at ({nearest.Tile.X}, {nearest.Tile.Y}) ({nearestAnyDist:0.1}m > {BlueprintBuildInteractRange:0.2}m) [{_currentTaskElapsed:0}s / {JobTimeoutSeconds:0}s]";
+                    $"Paused: Step closer to '{nearest.Item.EntityPrototypeId}' at ({nearest.Tile.X}, {nearest.Tile.Y}) ({nearestAnyDist:0.1}m > {SharedInteractionSystem.InteractionRange:0.2}m) [{_currentTaskElapsed:0}s / {JobTimeoutSeconds:0}s]";
 
                 if (_currentTaskElapsed >= JobTimeoutSeconds)
                 {
@@ -2237,7 +2236,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                     return true;
                 }
 
-                // 3. Deep container (e.g. toolbox/box inside backpack, secondary containers) & 2.5m vicinity fallback
+                // 3. Deep container (e.g. toolbox/box inside backpack, secondary containers) & interaction-range vicinity fallback
                 return TryEquipFromDeepInventoryOrVicinity(
                     player,
                     uid => MatchesMaterialOrStack(uid, matId) || MatchesMachinePart(uid, matId),
@@ -2710,8 +2709,8 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
 
         int needed = Math.Max(1, neededAmount);
 
-        // 1. Check up to MaxInteractRange (2.5m) via ItemUtilitySystem's vicinity search
-        var vicinityMatches = _itemUtil.FindItemsByPredicate(predicate, needed, MaxInteractRange);
+        // 1. Check within interaction range via ItemUtilitySystem's vicinity search
+        var vicinityMatches = _itemUtil.FindItemsByPredicate(predicate, needed, SharedInteractionSystem.InteractionRange);
         int vicinityTotal = vicinityMatches.Sum(m => m.StackCount);
         if (vicinityMatches.Count > 0 && vicinityTotal >= needed)
         {
@@ -2816,11 +2815,11 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             }
         }
 
-        // Also scan open StorageComponent entities within MaxInteractRange (e.g. open toolbox on the floor)
+        // Also scan open StorageComponent entities within interaction range (e.g. open toolbox on the floor)
         var playerCoords = _transform.GetMapCoordinates(player);
         if (playerCoords.MapId != MapId.Nullspace)
         {
-            foreach (var nearEnt in _lookup.GetEntitiesInRange(playerCoords, MaxInteractRange, LookupFlags.Uncontained))
+            foreach (var nearEnt in _lookup.GetEntitiesInRange(playerCoords, SharedInteractionSystem.InteractionRange, LookupFlags.Uncontained))
             {
                 if (nearEnt == player || !Exists(nearEnt) || !HasComp<StorageComponent>(nearEnt))
                     continue;
@@ -3013,7 +3012,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 score -= 0.01f;
 
             float playerDist = (pos.Position - playerPos.Position).Length();
-            if (playerDist > MaxInteractRange)
+            if (playerDist > SharedInteractionSystem.InteractionRange)
             {
                 if (score < bestOutOfRangeScore)
                 {
@@ -3376,7 +3375,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             return true;
         }
 
-        // 4. Deep container / 2.5m vicinity fallback
+        // 4. Deep container / interaction-range vicinity fallback
         if (_player.LocalEntity is { } p && Exists(p))
         {
             return TryEquipFromDeepInventoryOrVicinity(
