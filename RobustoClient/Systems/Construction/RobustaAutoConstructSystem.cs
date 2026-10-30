@@ -179,8 +179,9 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
             return;
         }
 
-        // Shift + V immediately triggers Deconstruct
-        if (_input.IsKeyDown(Keyboard.Key.Shift))
+        // A held deconstruct combination (whatever AutoDeconstructKey is configured to, e.g. N or Shift+V)
+        // immediately triggers Deconstruct instead of starting the build tap window.
+        if (RobustaConfig.AutoDeconstructKey.IsDown(_input))
         {
             _pendingSingleTap = false;
             _singleTapTimer = 0f;
@@ -508,9 +509,9 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
         if (_hudBannerTimer > 0f)
             _hudBannerTimer = Math.Max(0f, _hudBannerTimer - frameTime);
 
-        if (!_input.IsKeyDown(RobustaConfig.AutoConstructKey))
+        if (!RobustaConfig.AutoConstructKey.IsDown(_input))
             _wasConstructKeyDown = false;
-        if (!_input.IsKeyDown(RobustaConfig.AutoDeconstructKey))
+        if (!RobustaConfig.AutoDeconstructKey.IsDown(_input))
             _wasDeconstructKeyDown = false;
 
         if (_pendingSingleTap)
@@ -522,7 +523,7 @@ public sealed class RobustaAutoConstructSystem : EntitySystem
                 _singleTapTimer = 0f;
                 // If user is still holding the key at the end of the window -> Long-press Deconstruct;
                 // otherwise -> Auto-detect (builds ghosts/unfinished frames, deconstructs completed structures)
-                bool isHolding = _input.IsKeyDown(RobustaConfig.AutoConstructKey);
+                bool isHolding = RobustaConfig.AutoConstructKey.IsDown(_input);
                 TriggerAtCursor(forceDeconstruct: isHolding ? true : null);
                 return;
             }

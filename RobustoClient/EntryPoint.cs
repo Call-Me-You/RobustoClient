@@ -8,55 +8,39 @@ public sealed class EntryPoint : GameShared
 {
     [Dependency] private readonly IInputManager _inputManager = default!;
 
+    // Overwites upstream similar keybinds
+    private const int CommandBindingPriority = 10;
+
     public override void PostInit()
     {
         RobustaConfig.Load();
+        MarseyLogger.Info($"Config: {RobustaConfig.ConfigPath}");
         MarseyLogger.Debug("Building graph...");
         IoCManager.BuildGraph();
         MarseyLogger.Debug("Graph success built!");
         IoCManager.InjectDependencies(this);
-        var registration = new KeyBindingRegistration
-        {
-            Function = "robusta.toggle_menu",
-            BaseKey = Keyboard.Key.F4,
-            Type = KeyBindingType.Command
-        };
-        _inputManager.RegisterBinding(registration, false);
 
-        var autoConstructRegistration = new KeyBindingRegistration
-        {
-            Function = "robusta.auto_construct",
-            BaseKey = RobustaConfig.AutoConstructKey,
-            Type = KeyBindingType.Command
-        };
-        _inputManager.RegisterBinding(autoConstructRegistration, false);
-
-        var autoDeconstructRegistration = new KeyBindingRegistration
-        {
-            Function = "robusta.auto_deconstruct",
-            BaseKey = RobustaConfig.AutoDeconstructKey,
-            Type = KeyBindingType.Command
-        };
-        _inputManager.RegisterBinding(autoDeconstructRegistration, false);
-
-        var shiftDeconstructRegistration = new KeyBindingRegistration
-        {
-            Function = "robusta.auto_deconstruct",
-            BaseKey = RobustaConfig.AutoConstructKey,
-            Mod1 = Keyboard.Key.Shift,
-            Priority = 10,
-            Type = KeyBindingType.Command
-        };
-        _inputManager.RegisterBinding(shiftDeconstructRegistration, false);
-
-        var hackingRegistration = new KeyBindingRegistration
-        {
-            Function = "robusta.hack",
-            BaseKey = RobustaConfig.HackingKey,
-            Type = KeyBindingType.Command
-        };
-        _inputManager.RegisterBinding(hackingRegistration, false);
+        RegisterCommand("robusta.toggle_menu", RobustaConfig.ToggleMenuKey);
+        RegisterCommand("robusta.auto_construct", RobustaConfig.AutoConstructKey);
+        RegisterCommand("robusta.auto_deconstruct", RobustaConfig.AutoDeconstructKey);
+        RegisterCommand("robusta.hack", RobustaConfig.HackingKey);
 
         MarseyLogger.Debug("Setup context.");
+    }
+
+    private void RegisterCommand(string function, RobustaKeybind bind)
+    {
+        _inputManager.RegisterBinding(new KeyBindingRegistration
+        {
+            Function = function,
+            BaseKey = bind.BaseKey,
+            Mod1 = bind.Mod1,
+            Mod2 = bind.Mod2,
+            Mod3 = bind.Mod3,
+            Priority = CommandBindingPriority,
+            Type = KeyBindingType.Command
+        }, false);
+
+        MarseyLogger.Info($"Bound {function} to {bind}.");
     }
 }
