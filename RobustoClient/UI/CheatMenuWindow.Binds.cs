@@ -296,13 +296,13 @@ public sealed partial class CheatMenuWindow
             _listeningCooldown -= args.DeltaSeconds;
             return;
         }
-
+        /*
         if (_inputManager.IsKeyDown(Keyboard.Key.Escape))
         {
             StopListening();
             return;
         }
-
+        */ // Figure out how to not make this exit the menu
         if (_inputManager.IsKeyDown(Keyboard.Key.BackSpace) || _inputManager.IsKeyDown(Keyboard.Key.Delete))
         {
             ApplyBind(_activeListeningTarget.Value, new RobustaKeybind(Keyboard.Key.Unknown));
