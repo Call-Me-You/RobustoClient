@@ -1,3 +1,4 @@
+using Content.Shared.Interaction;
 using Content.Shared.Wires;
 using Robust.Client.Graphics;
 using Robust.Client.Input;
@@ -15,7 +16,6 @@ namespace RobustoClient.Systems.Hacking;
 public sealed class RobustaHackingSystem : EntitySystem
 {
     private const float CursorSearchRange = 0.65f;
-    private const float MaxInteractRange = 2.5f;
 
     [Dependency] private readonly IInputManager _input = default!;
     [Dependency] private readonly IPlayerManager _player = default!;
@@ -57,7 +57,7 @@ public sealed class RobustaHackingSystem : EntitySystem
         {
             if (outOfRangeTarget.HasValue && Exists(outOfRangeTarget.Value))
             {
-                var msg = $"Target '{Name(outOfRangeTarget.Value)}' is out of range ({outOfRangeDist:0.1}m > {MaxInteractRange:0.1}m) — move closer.";
+                var msg = $"Target '{Name(outOfRangeTarget.Value)}' is out of range ({outOfRangeDist:0.1}m > {SharedInteractionSystem.InteractionRange:0.1}m) — move closer.";
                 _log.Info(msg);
                 _wiresSolver.ReportStatusBanner("[AutoHack]", msg, isError: true, duration: 4.5f);
             }
@@ -107,7 +107,7 @@ public sealed class RobustaHackingSystem : EntitySystem
             var playerDist = (targetMapCoordinates.Position - playerMapCoordinates.Position).Length();
             var cursorDistance = (targetMapCoordinates.Position - cursorMapCoordinates.Position).LengthSquared();
 
-            if (playerDist > MaxInteractRange)
+            if (playerDist > SharedInteractionSystem.InteractionRange)
             {
                 if (cursorDistance < bestOutOfRangeCursorDist)
                 {

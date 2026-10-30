@@ -11,7 +11,7 @@ namespace RobustoClient.Commands;
 public sealed class AutoConstructCommand : IConsoleCommand
 {
     public string Command => "robusta.auto_construct";
-    public string Description => "Automatically builds (short tap V) or deconstructs (double-tap V / Shift+V) the structure/ghost under the cursor.";
+    public string Description => "Automatically builds (short tap V) or deconstructs (double-tap V / held AutoDeconstructKey) the structure/ghost under the cursor.";
     public string Help => "Usage: robusta.auto_construct [build|deconstruct|stop]";
 
     public void Execute(IConsoleShell shell, string argStr, string[] args)

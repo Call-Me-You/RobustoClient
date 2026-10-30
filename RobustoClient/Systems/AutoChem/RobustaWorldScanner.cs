@@ -12,6 +12,7 @@ using Content.Shared.Chemistry;
 using Content.Shared.Chemistry.Components;
 using Content.Shared.Chemistry.EntitySystems;
 using Content.Shared.Hands.EntitySystems;
+using Content.Shared.Interaction;
 using Content.Shared.Storage;
 using Robust.Shared.Containers;
 using RobustoClient.Systems.Abstract;
@@ -27,8 +28,6 @@ public sealed class RobustaWorldScanner : EntitySystem
     [Dependency] private readonly SharedHandsSystem _hands = default!;
     [Dependency] private readonly SharedContainerSystem _containerSystem = default!;
     [Dependency] private readonly ItemUtilitySystem _itemUtil = default!;
-
-    public const float InteractionRange = 1.5f;
 
     private static object? GetMemberValue(object obj, string name)
     {
@@ -84,7 +83,7 @@ public sealed class RobustaWorldScanner : EntitySystem
         if (localPlayer == null) return new List<EntityUid>();
 
         var playerPos = _transform.GetMapCoordinates(localPlayer.Value);
-        var entities = _lookup.GetEntitiesInRange(playerPos, InteractionRange, LookupFlags.Uncontained);
+        var entities = _lookup.GetEntitiesInRange(playerPos, SharedInteractionSystem.InteractionRange, LookupFlags.Uncontained);
 
         var kwLower = keyword.ToLower();
         var keywords = new List<string> { kwLower };

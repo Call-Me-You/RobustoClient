@@ -103,8 +103,8 @@
                             <Button Text="Open Tactical Radar" Name="OpenTacticalRadarBtn" HorizontalExpand="True" />
                         </BoxContainer>
                         <BoxContainer Orientation="Horizontal" SeparationOverride="10">
-                            <Button Text="Auto-Build (Tap V)" Name="AutoConstructBtn" HorizontalExpand="True" />
-                            <Button Text="Auto-Decon (2xV / N)" Name="AutoDeconstructBtn" HorizontalExpand="True" />
+                            <Button Text="Auto-Build (Tap Key)" Name="AutoConstructBtn" HorizontalExpand="True" />
+                            <Button Text="Auto-Decon (2x Tap / Hold)" Name="AutoDeconstructBtn" HorizontalExpand="True" />
                             <Button Text="Stop" Name="StopConstructBtn" />
                         </BoxContainer>
                         <BoxContainer Orientation="Horizontal" SeparationOverride="5">

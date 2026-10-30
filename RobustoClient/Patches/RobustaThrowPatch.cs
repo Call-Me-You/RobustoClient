@@ -64,7 +64,7 @@ public static class RobustaThrowPatch
         if (!RobustaConfig.ThrowAimbotEnabled) return;
 
         var input = IoCManager.Resolve<IInputManager>();
-        if (!input.IsKeyDown(RobustaConfig.TargetLockKey)) return;
+        if (!RobustaConfig.TargetLockKey.IsDown(input)) return;
 
         var clientMsg = __args[0]; 
         var fullMsg = __args[1];   

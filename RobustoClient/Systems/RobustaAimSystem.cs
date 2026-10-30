@@ -48,7 +48,7 @@ public class RobustaAimSystem : EntitySystem
 
         var inputMan = IoCManager.Resolve<IInputManager>();
         
-        if (!inputMan.IsKeyDown(RobustaConfig.TargetLockKey))
+        if (!RobustaConfig.TargetLockKey.IsDown(inputMan))
         {
             _lockedTarget = null;
             return;
