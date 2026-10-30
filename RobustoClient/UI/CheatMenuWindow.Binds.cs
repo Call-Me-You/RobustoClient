@@ -89,13 +89,27 @@ public sealed partial class CheatMenuWindow
             input.OnTextEntered += args =>
             {
                 if (TryParseKeybind(args.Text, out var parsed))
+                {
                     ApplyBind(discovered, parsed);
+                }
+                else
+                {
+                    var current = (RobustaKeybind)discovered.Field.GetValue(null)!;
+                    input.Text = current.IsValid ? current.ToString() : "";
+                }
             };
 
             input.OnFocusExit += args =>
             {
                 if (TryParseKeybind(args.Text, out var parsed))
+                {
                     ApplyBind(discovered, parsed);
+                }
+                else
+                {
+                    var current = (RobustaKeybind)discovered.Field.GetValue(null)!;
+                    input.Text = current.IsValid ? current.ToString() : "";
+                }
             };
 
             row.AddChild(label);
@@ -125,12 +139,11 @@ public sealed partial class CheatMenuWindow
 
     private void StopListening()
     {
-        if (_activeListeningTarget != null)
-        {
-            _activeListeningTarget.Value.BindButton.Text = "Bind";
-            _activeListeningTarget.Value.BindButton.RemoveStyleClass("ButtonColorGreen");
-        }
+        if (_activeListeningTarget == null)
+            return;
 
+        _activeListeningTarget.Value.BindButton.Text = "Bind";
+        _activeListeningTarget.Value.BindButton.RemoveStyleClass("ButtonColorGreen");
         _activeListeningTarget = null;
         _listeningCooldown = 0f;
     }
@@ -245,18 +258,15 @@ public sealed partial class CheatMenuWindow
             if (!Enum.TryParse<Keyboard.Key>(p, true, out var key) || !Enum.IsDefined(key))
                 return false;
 
-            bool isMod = IsModifier(key);
-
-            if (i == parts.Length - 1 && !isMod)
-            {
-                baseKey = key;
-            }
-            else if (isMod)
+            if (IsModifier(key))
             {
                 modifiers.Add(key);
             }
             else
             {
+                if (baseKey != null)
+                    return false;
+
                 baseKey = key;
             }
         }
@@ -290,6 +300,12 @@ public sealed partial class CheatMenuWindow
     {
         if (_activeListeningTarget == null)
             return;
+
+        if (!BindsSection.VisibleInTree)
+        {
+            StopListening();
+            return;
+        }
 
         if (_listeningCooldown > 0f)
         {
