@@ -38,7 +38,8 @@ public sealed class EntryPoint : GameShared
             Mod2 = bind.Mod2,
             Mod3 = bind.Mod3,
             Priority = CommandBindingPriority,
-            Type = KeyBindingType.Command
+            Type = KeyBindingType.Command,
+            CommandWhenUIFocused = false
         }, false);
 
         MarseyLogger.Info($"Bound {function} to {bind}.");
